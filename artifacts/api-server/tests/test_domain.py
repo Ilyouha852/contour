@@ -32,12 +32,15 @@ class IngestionTests(unittest.TestCase):
             "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
             "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
             "01.01.2024;1;10;100;Тест;Тест;false;7804105239;780401001;АИС ГЗ\n"
+            + ";" * 9
+            + "\n"
         ).encode()
-        items = "lot_id;product_name;okpd2_code\n10;Тест;33.12.1\n".encode()
+        items = ("lot_id;product_name;okpd2_code\n10;Тест;33.12.1\n;;\n").encode()
         suppliers = (
             "lot_id;supplier_inn;supplier_kpp;is_winner\n"
             "10;6.362E+11;780601001;false\n"
             "10;7804428656;780601001;true\n"
+            ";;;\n"
         ).encode()
         with temporary_database():
             result = import_csv_bytes(
@@ -48,9 +51,18 @@ class IngestionTests(unittest.TestCase):
             self.assertEqual(result["counts"]["participations"], 1)
             self.assertEqual(result["counts"]["skipped_unrecoverable_inn"], 1)
             self.assertEqual(result["warnings"][0]["row"], 2)
+            self.assertEqual(
+                result["ingestion_summary"]["files"]["notices"],
+                {"rows_read": 2, "blank_rows": 1, "imported_rows": 1},
+            )
+            self.assertEqual(result["ingestion_summary"]["files"]["items"]["blank_rows"], 1)
+            self.assertEqual(result["ingestion_summary"]["files"]["suppliers"]["blank_rows"], 1)
             with store.connection() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM participations").fetchone()[0], 1)
                 self.assertTrue(conn.execute("SELECT value FROM metadata WHERE key='data_version'").fetchone())
+                self.assertTrue(
+                    conn.execute("SELECT value FROM metadata WHERE key='ingestion_summary'").fetchone()
+                )
 
     def test_append_import_identifies_its_single_lot_even_when_history_exists(self):
         notices_header = (

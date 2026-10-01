@@ -130,6 +130,9 @@ def dataset_stats() -> dict[str, Any]:
         "ingestion_warnings": json.loads(metadata["ingestion_warnings"])
         if metadata.get("ingestion_warnings")
         else {"warnings": [], "omitted_warning_count": 0},
+        "last_ingestion_summary": json.loads(metadata["ingestion_summary"])
+        if metadata.get("ingestion_summary")
+        else None,
     }
 
 

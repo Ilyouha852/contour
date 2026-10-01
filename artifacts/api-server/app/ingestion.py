@@ -108,7 +108,13 @@ def parse_decimal(value: str | None) -> float | None:
     return float(parsed)
 
 
-def _csv_rows(content: bytes, filename: str, required: set[str]) -> Iterator[tuple[int, dict[str, str]]]:
+def _csv_rows(
+    content: bytes,
+    filename: str,
+    required: set[str],
+    *,
+    row_counts: dict[str, int] | None = None,
+) -> Iterator[tuple[int, dict[str, str]]]:
     try:
         text = io.TextIOWrapper(io.BytesIO(content), encoding="utf-8-sig", newline="")
         reader = csv.DictReader(text, delimiter=";")
@@ -120,7 +126,11 @@ def _csv_rows(content: bytes, filename: str, required: set[str]) -> Iterator[tup
                 detail={"file": filename, "missing_columns": missing},
             )
         for line_number, raw in enumerate(reader, start=2):
+            if row_counts is not None:
+                row_counts["rows_read"] = row_counts.get("rows_read", 0) + 1
             if raw is None or all(not (str(value or "").strip()) for value in raw.values()):
+                if row_counts is not None:
+                    row_counts["blank_rows"] = row_counts.get("blank_rows", 0) + 1
                 continue
             if None in raw:
                 raise HTTPException(
@@ -170,6 +180,11 @@ def import_csv_bytes(
     warning_count = 0
     single_lot_id: str | None = None
     multiple_lots = False
+    row_counts = {
+        "notices": {"rows_read": 0, "blank_rows": 0},
+        "items": {"rows_read": 0, "blank_rows": 0},
+        "suppliers": {"rows_read": 0, "blank_rows": 0},
+    }
     file_hashes = {
         "notices": hashlib.sha256(notice_bytes).hexdigest(),
         "items": hashlib.sha256(item_bytes).hexdigest(),
@@ -189,7 +204,9 @@ def import_csv_bytes(
             conn.execute("DELETE FROM lot_items")
             conn.execute("DELETE FROM lots")
 
-        for line, row in _csv_rows(notice_bytes, notice_name, NOTICE_COLUMNS):
+        for line, row in _csv_rows(
+            notice_bytes, notice_name, NOTICE_COLUMNS, row_counts=row_counts["notices"]
+        ):
             try:
                 lot_id = row["lot_id"].strip()
                 if not lot_id:
@@ -235,7 +252,9 @@ def import_csv_bytes(
             conn.execute("DELETE FROM lot_items WHERE lot_id IN (SELECT lot_id FROM fresh_lots)")
             conn.execute("DELETE FROM participations WHERE lot_id IN (SELECT lot_id FROM fresh_lots)")
 
-        for line, row in _csv_rows(item_bytes, item_name, ITEM_COLUMNS):
+        for line, row in _csv_rows(
+            item_bytes, item_name, ITEM_COLUMNS, row_counts=row_counts["items"]
+        ):
             lot_id = row["lot_id"].strip()
             if not lot_id or not in_lot(conn, lot_id):
                 counts["orphan_items"] += 1
@@ -248,7 +267,12 @@ def import_csv_bytes(
             counts["items"] += 1
 
         if supplier_bytes:
-            for line, row in _csv_rows(supplier_bytes, supplier_name, PARTICIPATION_COLUMNS):
+            for line, row in _csv_rows(
+                supplier_bytes,
+                supplier_name,
+                PARTICIPATION_COLUMNS,
+                row_counts=row_counts["suppliers"],
+            ):
                 lot_id = row["lot_id"].strip()
                 if not lot_id or not in_lot(conn, lot_id):
                     counts["orphan_participations"] += 1
@@ -344,6 +368,30 @@ def import_csv_bytes(
                 ),
             ),
         )
+        ingestion_summary = {
+            "files": {
+                "notices": {
+                    **row_counts["notices"],
+                    "imported_rows": counts["notices"],
+                },
+                "items": {
+                    **row_counts["items"],
+                    "imported_rows": counts["items"],
+                    "orphan_rows": counts["orphan_items"],
+                },
+                "suppliers": {
+                    **row_counts["suppliers"],
+                    "imported_rows": counts["participations"],
+                    "orphan_rows": counts["orphan_participations"],
+                    "unrecoverable_inn_rows": counts["skipped_unrecoverable_inn"],
+                },
+            }
+        }
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES('ingestion_summary',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(ingestion_summary, ensure_ascii=False),),
+        )
         conn.execute(
             "INSERT INTO metadata(key,value) VALUES('weights',?) ON CONFLICT(key) DO NOTHING",
             (json.dumps({**DEFAULT_WEIGHTS, **DEFAULT_PARAMETERS}, ensure_ascii=False),),
@@ -356,6 +404,7 @@ def import_csv_bytes(
         "source_hashes": file_hashes,
         "warnings": warnings,
         "omitted_warning_count": max(0, warning_count - len(warnings)),
+        "ingestion_summary": ingestion_summary,
     }
     if not replace:
         result["single_lot_id"] = single_lot_id if not multiple_lots else None
