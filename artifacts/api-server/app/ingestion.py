@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import re
 from collections import Counter
 from datetime import date, datetime, timezone
@@ -42,13 +43,33 @@ def normalize_inn(value: str | None) -> str | None:
     # Spreadsheet exports sometimes turn a 12-digit INN into e.g. 6.362E+11.
     if "e" in raw.lower():
         try:
-            raw = format(Decimal(raw), "f").split(".")[0]
+            parsed = Decimal(raw)
+            raw = format(parsed, "f").split(".")[0]
         except InvalidOperation as exc:
             raise ValueError(f"неверный формат ИНН: {value}") from exc
+        if not parsed.is_finite() or not _valid_inn_checksum(raw):
+            raise ValueError(
+                "ИНН в научной нотации не проходит контрольную сумму; "
+                "исходные цифры по этому CSV восстановить нельзя"
+            )
     raw = raw.replace("'", "")
     if not INN_RE.fullmatch(raw):
         raise ValueError(f"ИНН должен содержать 10 или 12 цифр: {value}")
     return raw
+
+
+def _valid_inn_checksum(inn: str) -> bool:
+    if not INN_RE.fullmatch(inn):
+        return False
+    digits = [int(digit) for digit in inn]
+    checksum_10 = (sum(a * b for a, b in zip(digits[:9], (2, 4, 10, 3, 5, 9, 4, 6, 8))) % 11) % 10
+    if len(digits) == 10:
+        return digits[9] == checksum_10
+    checksum_11 = (sum(a * b for a, b in zip(digits[:10], (7, 2, 4, 10, 3, 5, 9, 4, 6, 8))) % 11) % 10
+    checksum_12 = (
+        sum(a * b for a, b in zip(digits[:11], (3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8))) % 11
+    ) % 10
+    return digits[10] == checksum_11 and digits[11] == checksum_12
 
 
 def parse_bool(value: str | None, *, filename: str, column: str, row_number: int) -> int | None:
@@ -113,6 +134,11 @@ def _csv_rows(content: bytes, filename: str, required: set[str]) -> Iterator[tup
         raise HTTPException(status_code=400, detail={"file": filename, "error": str(exc)}) from exc
 
 
+def _data_version(source_hashes: dict[str, str]) -> str:
+    canonical = json.dumps(source_hashes, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
 async def read_upload(upload: UploadFile | None, required: bool = True) -> tuple[str, bytes] | None:
     if upload is None:
         if required:
@@ -140,15 +166,19 @@ def import_csv_bytes(
     supplier_name, supplier_bytes = suppliers_file or ("", b"")
     counts: Counter[str] = Counter()
     item_positions: Counter[str] = Counter()
+    warnings: list[dict[str, object]] = []
+    warning_count = 0
+    single_lot_id: str | None = None
+    multiple_lots = False
     file_hashes = {
         "notices": hashlib.sha256(notice_bytes).hexdigest(),
         "items": hashlib.sha256(item_bytes).hexdigest(),
         "suppliers": hashlib.sha256(supplier_bytes).hexdigest(),
     }
-    data_version = hashlib.sha256("".join(file_hashes.values()).encode()).hexdigest()[:16]
 
     with connection() as conn:
         previous_metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM metadata")}
+        previous_hashes = json.loads(previous_metadata.get("source_hashes", "{}"))
         conn.execute("CREATE TEMP TABLE IF NOT EXISTS fresh_lots(lot_id TEXT PRIMARY KEY)")
         conn.execute("DELETE FROM fresh_lots")
         if replace:
@@ -164,6 +194,11 @@ def import_csv_bytes(
                 lot_id = row["lot_id"].strip()
                 if not lot_id:
                     raise ValueError("lot_id не может быть пустым")
+                if not replace:
+                    if single_lot_id is None:
+                        single_lot_id = lot_id
+                    elif lot_id != single_lot_id:
+                        multiple_lots = True
                 is_smp = parse_bool(row["is_smp"], filename=notice_name, column="is_smp", row_number=line)
                 customer_inn = normalize_inn(row["customer_inn"])
                 conn.execute(
@@ -202,7 +237,7 @@ def import_csv_bytes(
 
         for line, row in _csv_rows(item_bytes, item_name, ITEM_COLUMNS):
             lot_id = row["lot_id"].strip()
-            if not lot_id or lot_id not in_lot(conn, lot_id):
+            if not lot_id or not in_lot(conn, lot_id):
                 counts["orphan_items"] += 1
                 continue
             item_positions[lot_id] += 1
@@ -222,6 +257,25 @@ def import_csv_bytes(
                     inn = normalize_inn(row["supplier_inn"])
                     if not inn:
                         raise ValueError("supplier_inn не может быть пустым")
+                except ValueError as exc:
+                    if "научной нотации" not in str(exc):
+                        raise HTTPException(
+                            status_code=400,
+                            detail={"file": supplier_name, "row": line, "error": str(exc)},
+                        ) from exc
+                    counts["skipped_unrecoverable_inn"] += 1
+                    warning_count += 1
+                    if len(warnings) < 20:
+                        warnings.append(
+                            {
+                                "file": supplier_name,
+                                "row": line,
+                                "column": "supplier_inn",
+                                "error": str(exc),
+                            }
+                        )
+                    continue
+                try:
                     is_winner = parse_bool(
                         row["is_winner"], filename=supplier_name, column="is_winner", row_number=line
                     )
@@ -252,10 +306,20 @@ def import_csv_bytes(
               SELECT COUNT(*) FROM lot_items AS same_lot WHERE same_lot.lot_id = lot_items.lot_id
             )"""
         )
-        if not replace and previous_metadata.get("data_version"):
-            data_version = hashlib.sha256(
-                f"{previous_metadata['data_version']}:{data_version}".encode()
-            ).hexdigest()[:16]
+        if replace:
+            source_hashes = {
+                key: value for key, value in previous_hashes.items() if key.startswith("registry:")
+            }
+            source_hashes.update(file_hashes)
+        else:
+            supplement_id = hashlib.sha256(
+                json.dumps(file_hashes, sort_keys=True).encode()
+            ).hexdigest()[:12]
+            source_hashes = {
+                **previous_hashes,
+                **{f"supplement:{supplement_id}:{key}": value for key, value in file_hashes.items()},
+            }
+        data_version = _data_version(source_hashes)
         _rebuild_lot_tokens(conn)
         conn.execute(
             "INSERT INTO metadata(key,value) VALUES('data_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -264,14 +328,17 @@ def import_csv_bytes(
         conn.execute(
             "INSERT INTO metadata(key,value) VALUES('source_hashes',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (
-                __import__("json").dumps(
+                json.dumps(source_hashes, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES('ingestion_warnings',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                json.dumps(
                     {
-                        **(
-                            __import__("json").loads(previous_metadata["source_hashes"])
-                            if not replace and previous_metadata.get("source_hashes")
-                            else {}
-                        ),
-                        **file_hashes,
+                        "warnings": warnings,
+                        "omitted_warning_count": max(0, warning_count - len(warnings)),
                     },
                     ensure_ascii=False,
                 ),
@@ -279,15 +346,20 @@ def import_csv_bytes(
         )
         conn.execute(
             "INSERT INTO metadata(key,value) VALUES('weights',?) ON CONFLICT(key) DO NOTHING",
-            (__import__("json").dumps({**DEFAULT_WEIGHTS, **DEFAULT_PARAMETERS}, ensure_ascii=False),),
+            (json.dumps({**DEFAULT_WEIGHTS, **DEFAULT_PARAMETERS}, ensure_ascii=False),),
         )
 
-    return {
+    result: dict[str, object] = {
         "data_version": data_version,
         "counts": dict(counts),
         "skipped_blank_rows": "пустые строки пропущены",
         "source_hashes": file_hashes,
+        "warnings": warnings,
+        "omitted_warning_count": max(0, warning_count - len(warnings)),
     }
+    if not replace:
+        result["single_lot_id"] = single_lot_id if not multiple_lots else None
+    return result
 
 
 def in_lot(conn, lot_id: str) -> bool:
@@ -347,6 +419,7 @@ def import_registry_csv(
     count = 0
     table = "msp" if kind == "msp" else "rnp"
     with connection() as conn:
+        conn.execute(f"DELETE FROM {table}")
         for row_number, raw in enumerate(reader, start=2):
             if not raw or all(not str(v or "").strip() for v in raw.values()):
                 continue
@@ -391,8 +464,17 @@ def import_registry_csv(
                 count += 1
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail={"file": filename, "row": row_number, "error": str(exc)}) from exc
-        conn.execute(
-            "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM metadata")}
+        source_hashes = json.loads(metadata.get("source_hashes", "{}"))
+        source_hashes[f"registry:{table}"] = hashlib.sha256(content).hexdigest()
+        data_version = _data_version(source_hashes)
+        for key, value in (
             (f"{table}_source_date", fetched_at),
-        )
+            ("source_hashes", json.dumps(source_hashes, ensure_ascii=False, sort_keys=True)),
+            ("data_version", data_version),
+        ):
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
     return {"source": table, "records_loaded": count, "source_file": filename, "fetched_at": fetched_at}

@@ -96,22 +96,56 @@ def _candidate_sources(conn, lot: dict[str, Any], item_codes: list[str], title: 
             (*params, limit),
         ).fetchall()
 
-    target_tokens = tokenize(title, 12)
+    target_tokens = sorted(set(tokenize(title, 12)))
     text_weights: dict[str, float] = {}
     if target_tokens:
         marks = ",".join("?" for _ in target_tokens)
-        matched = conn.execute(
-            f"""SELECT t.lot_id, COUNT(*) AS overlap, l.publish_date
+        before_date = target_date.isoformat()
+        document_count = conn.execute(
+            """SELECT COUNT(DISTINCT t.lot_id)
             FROM lot_tokens t JOIN lots l ON l.lot_id=t.lot_id
-            WHERE t.token IN ({marks}) AND t.lot_id<>?
-              AND l.publish_date IS NOT NULL AND l.publish_date<?
-            GROUP BY t.lot_id
-            ORDER BY overlap DESC, l.publish_date DESC
-            LIMIT ?""",
-            (*target_tokens, lot["lot_id"], target_date.isoformat(), MAX_TEXT_LOTS),
-        ).fetchall()
-        for row in matched:
-            text_weights[row["lot_id"]] = min(1.0, row["overlap"] / max(1, len(target_tokens)))
+            WHERE l.publish_date IS NOT NULL AND l.publish_date<?""",
+            (before_date,),
+        ).fetchone()[0]
+        if document_count:
+            document_frequencies = {
+                row["token"]: int(row["document_frequency"])
+                for row in conn.execute(
+                    f"""SELECT t.token,COUNT(DISTINCT t.lot_id) AS document_frequency
+                    FROM lot_tokens t JOIN lots l ON l.lot_id=t.lot_id
+                    WHERE t.token IN ({marks}) AND l.publish_date IS NOT NULL AND l.publish_date<?
+                    GROUP BY t.token""",
+                    (*target_tokens, before_date),
+                )
+            }
+            token_weights = {
+                token: math.log1p(
+                    (document_count - document_frequencies.get(token, 0) + 0.5)
+                    / (document_frequencies.get(token, 0) + 0.5)
+                )
+                for token in target_tokens
+            }
+            total_token_weight = sum(token_weights.values())
+            weighted_terms = " ".join("WHEN ? THEN ?" for _ in target_tokens)
+            case_parameters = [
+                value for token in target_tokens for value in (token, token_weights[token])
+            ]
+            matched = conn.execute(
+                f"""SELECT t.lot_id,
+                    SUM(CASE t.token {weighted_terms} ELSE 0 END) AS overlap_weight,
+                    l.publish_date
+                FROM lot_tokens t JOIN lots l ON l.lot_id=t.lot_id
+                WHERE t.token IN ({marks}) AND t.lot_id<>?
+                  AND l.publish_date IS NOT NULL AND l.publish_date<?
+                GROUP BY t.lot_id,l.publish_date
+                ORDER BY overlap_weight DESC,l.publish_date DESC,t.lot_id DESC
+                LIMIT ?""",
+                (*case_parameters, *target_tokens, lot["lot_id"], before_date, MAX_TEXT_LOTS),
+            ).fetchall()
+            for row in matched:
+                text_weights[row["lot_id"]] = min(
+                    1.0, float(row["overlap_weight"]) / max(1e-9, total_token_weight)
+                )
     text_supplier_inns: set[str] = set()
     text_lot_ids = list(text_weights)
     for start in range(0, len(text_lot_ids), 800):
@@ -131,7 +165,7 @@ def _candidate_sources(conn, lot: dict[str, Any], item_codes: list[str], title: 
             "category_wins": int(row["category_wins"] or 0),
             "source_msp": False,
         }
-    for inn in text_supplier_inns:
+    for inn in sorted(text_supplier_inns):
         candidates.setdefault(inn, {"category_lots": 0, "category_wins": 0, "source_msp": False})
 
     # In a thin category, add only matching MСП companies from the local registry.
@@ -180,8 +214,11 @@ def _supplier_history(conn, inns: list[str], lot: dict[str, Any], text_lot_ids: 
         chunk = inns[start : start + 300]
         marks = ",".join("?" for _ in chunk)
         counts = conn.execute(
-            f"SELECT supplier_inn, COUNT(DISTINCT lot_id) AS n_lots FROM participations WHERE supplier_inn IN ({marks}) GROUP BY supplier_inn",
-            chunk,
+            f"""SELECT p.supplier_inn,COUNT(DISTINCT p.lot_id) AS n_lots
+            FROM participations p JOIN lots l ON l.lot_id=p.lot_id
+            WHERE p.supplier_inn IN ({marks}) AND l.publish_date IS NOT NULL AND l.publish_date<?
+            GROUP BY p.supplier_inn""",
+            (*chunk, target_date.isoformat()),
         )
         total_lots.update({row["supplier_inn"]: int(row["n_lots"]) for row in counts})
         rows = conn.execute(
@@ -318,7 +355,8 @@ def _score_supplier(
                 )
             for code in codes:
                 if code:
-                    unique_classes.add(code.split(".")[0])
+                    parts = code.split(".")
+                    unique_classes.add(".".join(parts[:2]) if len(parts) > 1 else parts[0])
 
         raw_scores = {
             "F1": 1.0 - math.exp(-experience / max(0.1, parameters["tau"])),

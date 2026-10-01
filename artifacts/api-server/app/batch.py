@@ -17,10 +17,13 @@ def create_batch_run(lot_ids: list[str] | None, top_k: int, loss_weight: float |
             lot_ids = list(dict.fromkeys(lot_ids))
             if len(lot_ids) > MAX_BATCH_LOTS:
                 raise ValueError(f"За один пакет можно отправить не более {MAX_BATCH_LOTS} лотов")
-            placeholders = ",".join("?" for _ in lot_ids)
-            n_lots = conn.execute(
-                f"SELECT COUNT(*) FROM lots WHERE lot_id IN ({placeholders})", lot_ids
-            ).fetchone()[0]
+            n_lots = 0
+            for start in range(0, len(lot_ids), 900):
+                chunk = lot_ids[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                n_lots += conn.execute(
+                    f"SELECT COUNT(*) FROM lots WHERE lot_id IN ({placeholders})", chunk
+                ).fetchone()[0]
             if n_lots != len(lot_ids):
                 raise ValueError("В списке есть lot_id, которых нет в базе")
         else:

@@ -36,12 +36,18 @@ def seed_dataset_if_empty() -> None:
         logger.warning("No bundled CSV data found; start with an empty database and use /api/v1/datasets/import")
         return
     try:
-        import_csv_bytes(
+        result = import_csv_bytes(
             (notice_path.name, notice_path.read_bytes()),
             (item_path.name, item_path.read_bytes()),
             (supplier_path.name, supplier_path.read_bytes()) if supplier_path else None,
         )
         logger.info("Seed dataset imported from attached CSV files")
+        if result.get("warnings"):
+            logger.warning(
+                "Seed import skipped %s participation rows because their INNs could not be recovered: %s",
+                result["counts"].get("skipped_unrecoverable_inn", 0),
+                result["warnings"],
+            )
     except Exception:
         logger.exception("Could not import the bundled dataset")
         raise
@@ -94,6 +100,10 @@ def dataset_stats() -> dict[str, Any]:
     with connection() as conn:
         counts = {
             "lots": conn.execute("SELECT COUNT(*) FROM lots").fetchone()[0],
+            "lots_with_items": conn.execute("SELECT COUNT(DISTINCT lot_id) FROM lot_items").fetchone()[0],
+            "lots_with_participations": conn.execute(
+                "SELECT COUNT(DISTINCT lot_id) FROM participations"
+            ).fetchone()[0],
             "items": conn.execute("SELECT COUNT(*) FROM lot_items").fetchone()[0],
             "participations": conn.execute("SELECT COUNT(*) FROM participations").fetchone()[0],
             "suppliers": conn.execute("SELECT COUNT(DISTINCT supplier_inn) FROM participations").fetchone()[0],
@@ -104,9 +114,22 @@ def dataset_stats() -> dict[str, Any]:
         last_date = conn.execute("SELECT MAX(publish_date) FROM lots").fetchone()[0]
     return {
         "counts": counts,
+        "coverage": {
+            "lots_with_items_percent": round(100 * counts["lots_with_items"] / counts["lots"], 2)
+            if counts["lots"]
+            else 0.0,
+            "lots_with_participations_percent": round(
+                100 * counts["lots_with_participations"] / counts["lots"], 2
+            )
+            if counts["lots"]
+            else 0.0,
+        },
         "data_version": metadata.get("data_version"),
         "last_publish_date": last_date,
         "source_hashes": json.loads(metadata["source_hashes"]) if metadata.get("source_hashes") else {},
+        "ingestion_warnings": json.loads(metadata["ingestion_warnings"])
+        if metadata.get("ingestion_warnings")
+        else {"warnings": [], "omitted_warning_count": 0},
     }
 
 
@@ -115,7 +138,9 @@ async def import_dataset(
     notices_file: UploadFile = File(..., description="CSV извещений, разделитель ;"),
     items_file: UploadFile = File(..., description="CSV товаров, работ и услуг"),
     suppliers_file: UploadFile | None = File(default=None, description="CSV участников, необязательный"),
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ) -> dict[str, Any]:
+    _check_admin(x_admin_token)
     notices = await read_upload(notices_file)
     items = await read_upload(items_file)
     suppliers = await read_upload(suppliers_file, required=False)
@@ -136,6 +161,7 @@ async def get_recommendations(request: Request) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         lot_id, top_k, loss_weight = body.lot_id, body.top_k, body.loss_weight
     elif "multipart/form-data" in content_type:
+        _check_admin(request.headers.get("X-Admin-Token"))
         form = await request.form()
         notices_file = form.get("notices_file") or form.get("notice_file")
         items_file = form.get("items_file") or form.get("tru_file")
@@ -149,19 +175,17 @@ async def get_recommendations(request: Request) -> dict[str, Any]:
         items = await read_upload(items_file)
         suppliers = await read_upload(suppliers_file, required=False) if hasattr(suppliers_file, "read") else None
         assert notices is not None and items is not None
-        import_csv_bytes(notices, items, suppliers, replace=False)
+        import_result = import_csv_bytes(notices, items, suppliers, replace=False)
         requested_lot_id = str(form.get("lot_id") or "").strip()
         if requested_lot_id:
             lot_id = requested_lot_id
         else:
-            with connection() as conn:
-                ids = [row["lot_id"] for row in conn.execute("SELECT lot_id FROM lots ORDER BY lot_id LIMIT 2")]
-            if len(ids) != 1:
+            lot_id = import_result.get("single_lot_id")
+            if not lot_id:
                 raise HTTPException(
                     status_code=422,
                     detail="Передайте lot_id в форме: загруженный набор содержит несколько лотов.",
                 )
-            lot_id = ids[0]
         try:
             top_k = min(100, max(1, int(form.get("top_k", 20))))
             if form.get("loss_weight") not in (None, ""):
