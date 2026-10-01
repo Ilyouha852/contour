@@ -1,40 +1,46 @@
-# [Project name]
+# Подбор релевантных контрагентов
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+FastAPI backend для ранжирования поставщиков, производителей и дистрибьюторов по закупкам Санкт-Петербурга.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- API запускается workflow `artifacts/api-server` на FastAPI и доступен под `/api`
+- `/api/docs` — Swagger UI; `/api/healthz` — проверка
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Optional env: `DATABASE_PATH` — path to SQLite; `ADMIN_TOKEN` — guard for registry refresh
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- API: Python 3.13, FastAPI, Uvicorn
+- DB: SQLite (local, file-backed)
+- The workspace retains generated TypeScript API/database packages; the running backend contract is FastAPI's `/api/openapi.json`
+- Python dependencies are declared in the root `pyproject.toml`
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/api-server/app/` — FastAPI routes, import pipeline, ranking engine, batch processing, and exports
+- `artifacts/api-server/data/source/` — bundled source CSV files
+- `artifacts/api-server/README.md` — API reference and ranking notes
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Only the backend is in scope; do not add a frontend unless requested.
+- Ranking must not depend on external neural-network APIs.
+- Registry enrichment is offline: administrators upload source CSV files.
+- SQLite with a local token index is the self-contained first implementation; the source specification's PostgreSQL/Elasticsearch target is a future scale-up path.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Analysts can import procurement CSVs, request explained supplier recommendations, inspect supplier and lot histories, process a batch, export CSV/XLSX, and load MSP/RNP enrichment snapshots.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Use Python + FastAPI.
+- Build backend only; no frontend.
 
 ## Gotchas
 

@@ -1,0 +1,1 @@
+"""FastAPI backend for the Saint Petersburg procurement supplier finder."""

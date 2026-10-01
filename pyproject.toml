@@ -1,0 +1,11 @@
+[project]
+name = "counterparty-recommender"
+version = "0.1.0"
+description = "FastAPI backend for procurement supplier recommendations"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.142.2",
+    "openpyxl>=3.1.5",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.54.0",
+]
