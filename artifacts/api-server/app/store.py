@@ -45,27 +45,6 @@ CREATE TABLE IF NOT EXISTS participations (
 CREATE INDEX IF NOT EXISTS idx_participations_supplier ON participations(supplier_inn);
 CREATE INDEX IF NOT EXISTS idx_participations_winner ON participations(is_winner, lot_id);
 
-CREATE TABLE IF NOT EXISTS msp (
-    inn TEXT PRIMARY KEY,
-    name TEXT,
-    category TEXT,
-    okved TEXT NOT NULL DEFAULT '',
-    region TEXT,
-    included_at TEXT,
-    source_file TEXT NOT NULL,
-    fetched_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS rnp (
-    inn TEXT NOT NULL,
-    reg_number TEXT NOT NULL DEFAULT '',
-    date_in TEXT,
-    date_out TEXT,
-    source_file TEXT NOT NULL,
-    fetched_at TEXT NOT NULL,
-    PRIMARY KEY (inn, reg_number)
-);
-CREATE INDEX IF NOT EXISTS idx_rnp_inn ON rnp(inn);
-
 CREATE TABLE IF NOT EXISTS lot_tokens (
     lot_id TEXT NOT NULL REFERENCES lots(lot_id) ON DELETE CASCADE,
     token TEXT NOT NULL,
@@ -98,9 +77,14 @@ CREATE TABLE IF NOT EXISTS recommendations (
     score REAL NOT NULL,
     role TEXT NOT NULL,
     role_conf REAL NOT NULL,
+    role_source TEXT NOT NULL DEFAULT 'history',
+    role_signals_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL,
     is_msp INTEGER,
     risk INTEGER NOT NULL DEFAULT 0,
+    msp_status TEXT NOT NULL DEFAULT 'unknown',
+    risk_status TEXT NOT NULL DEFAULT 'unknown',
+    enrichment_json TEXT NOT NULL DEFAULT '{}',
     factors_json TEXT NOT NULL,
     factor_scores_json TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
@@ -139,3 +123,28 @@ def initialize_database() -> None:
     with connection() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        conn.execute("DROP TABLE IF EXISTS rnp")
+        conn.execute("DROP TABLE IF EXISTS msp")
+        recommendation_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(recommendations)")
+        }
+        if "msp_status" not in recommendation_columns:
+            conn.execute(
+                "ALTER TABLE recommendations ADD COLUMN msp_status TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if "risk_status" not in recommendation_columns:
+            conn.execute(
+                "ALTER TABLE recommendations ADD COLUMN risk_status TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if "enrichment_json" not in recommendation_columns:
+            conn.execute(
+                "ALTER TABLE recommendations ADD COLUMN enrichment_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "role_source" not in recommendation_columns:
+            conn.execute(
+                "ALTER TABLE recommendations ADD COLUMN role_source TEXT NOT NULL DEFAULT 'history'"
+            )
+        if "role_signals_json" not in recommendation_columns:
+            conn.execute(
+                "ALTER TABLE recommendations ADD COLUMN role_signals_json TEXT NOT NULL DEFAULT '[]'"
+            )

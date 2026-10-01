@@ -1,14 +1,30 @@
 from contextlib import contextmanager
+from io import BytesIO
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.error import URLError
+
+from openpyxl import load_workbook
 
 from app import store
 from app.batch import create_batch_run, execute_batch
-from app.engine import _candidate_sources, _supplier_history, code_similarity
+from app.engine import (
+    _candidate_sources,
+    _msp_item_coverage,
+    _role,
+    _role_signals,
+    _supplier_history,
+    code_similarity,
+    recommend,
+    weighted_code_similarity,
+)
+from app.evaluation import ranking_metrics, run_backtest
 from app.exports import export_csv, export_xlsx
-from app.ingestion import import_csv_bytes, import_registry_csv, normalize_inn, parse_bool, parse_date
+from app.ingestion import import_csv_bytes, normalize_inn, parse_bool, parse_date
+from app.registries import _lookup_rnp_one, lookup_msp, lookup_msp_by_profile
 from app.text import text_similarity, tokenize
 
 
@@ -115,26 +131,15 @@ class IngestionTests(unittest.TestCase):
             )
             self.assertEqual(result["single_lot_id"], "20")
 
-    def test_registry_refresh_replaces_snapshot_and_changes_data_version(self):
+    def test_database_does_not_create_registry_storage(self):
         with temporary_database():
-            first = (
-                "inn;name;okved\n7804428656;Первая компания;46.1\n"
-                "7802023485;Вторая компания;46.2\n"
-            ).encode()
-            second = "inn;name;okved\n7804428656;Обновлённая компания;46.1\n".encode()
-            import_registry_csv("msp", "msp-old.csv", first)
             with store.connection() as conn:
-                old_version = conn.execute(
-                    "SELECT value FROM metadata WHERE key='data_version'"
-                ).fetchone()["value"]
-            import_registry_csv("msp", "msp-current.csv", second)
-            with store.connection() as conn:
-                rows = conn.execute("SELECT inn,name FROM msp").fetchall()
-                new_version = conn.execute(
-                    "SELECT value FROM metadata WHERE key='data_version'"
-                ).fetchone()["value"]
-            self.assertEqual([(row["inn"], row["name"]) for row in rows], [("7804428656", "Обновлённая компания")])
-            self.assertNotEqual(old_version, new_version)
+                tables = {
+                    row["name"]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                }
+            self.assertNotIn("msp", tables)
+            self.assertNotIn("rnp", tables)
 
     def test_supplier_history_excludes_later_participations(self):
         with temporary_database():
@@ -161,10 +166,11 @@ class IngestionTests(unittest.TestCase):
         notices = (
             "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
             "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
-            "01.01.2024;1;10;100;Тест;Тест;false;7804105239;780401001;АИС ГЗ\n"
+            "01.01.2023;1;9;100;Тест;Тест;false;7804105239;780401001;АИС ГЗ\n"
+            "01.01.2024;2;10;100;Тест;Тест;false;7804105239;780401001;АИС ГЗ\n"
         ).encode()
-        items = "lot_id;product_name;okpd2_code\n10;Тест;33.12.1\n".encode()
-        suppliers = "lot_id;supplier_inn;supplier_kpp;is_winner\n10;7804428656;780601001;true\n".encode()
+        items = "lot_id;product_name;okpd2_code\n9;Тест;33.12.1\n10;Тест;33.12.1\n".encode()
+        suppliers = "lot_id;supplier_inn;supplier_kpp;is_winner\n9;7804428656;780601001;true\n".encode()
         with temporary_database():
             import_csv_bytes(
                 ("notices.csv", notices),
@@ -172,15 +178,56 @@ class IngestionTests(unittest.TestCase):
                 ("suppliers.csv", suppliers),
             )
             run = create_batch_run(["10"], top_k=5, loss_weight=None)
-            execute_batch(run["run_id"], run["lot_ids"], top_k=5, loss_weight=None)
+            with (
+                patch("app.engine.lookup_msp_by_profile", return_value=({}, None)),
+                patch("app.engine.lookup_msp", return_value=({}, None)),
+                patch(
+                    "app.engine.lookup_rnp",
+                    return_value={
+                        "7804428656": {
+                            "status": "clear",
+                            "source": "ЕИС",
+                            "source_url": "https://example.test/rnp",
+                            "checked_at": "2026-10-01T12:00:00+00:00",
+                        }
+                    },
+                ),
+            ):
+                execute_batch(run["run_id"], run["lot_ids"], top_k=5, loss_weight=None)
+                single = recommend("10", top_k=5)
             with store.connection() as conn:
                 saved = conn.execute(
                     "SELECT status,n_lots,completed_lots FROM runs WHERE run_id=?",
                     (run["run_id"],),
                 ).fetchone()
+                recommendation = conn.execute(
+                    "SELECT msp_status,risk_status,enrichment_json,role_source,role_signals_json "
+                    "FROM recommendations WHERE run_id=?",
+                    (run["run_id"],),
+                ).fetchone()
+                single_recommendation = conn.execute(
+                    "SELECT role_source,role_signals_json,enrichment_json FROM recommendations WHERE run_id=?",
+                    (single["run_id"],),
+                ).fetchone()
             self.assertEqual((saved["status"], saved["n_lots"], saved["completed_lots"]), ("done", 1, 1))
-            self.assertTrue(export_csv(run["run_id"]).startswith(b"\xef\xbb\xbf"))
-            self.assertTrue(export_xlsx(run["run_id"]).startswith(b"PK"))
+            self.assertEqual((recommendation["msp_status"], recommendation["risk_status"]), ("not_member", "clear"))
+            enrichment = json.loads(recommendation["enrichment_json"])
+            self.assertEqual(enrichment["rnp"]["source_url"], "https://example.test/rnp")
+            self.assertEqual(enrichment["rnp"]["checked_at"], "2026-10-01T12:00:00+00:00")
+            self.assertEqual(recommendation["role_source"], "история закупок")
+            self.assertTrue(json.loads(recommendation["role_signals_json"]))
+            self.assertEqual(single_recommendation["role_source"], "история закупок")
+            self.assertTrue(json.loads(single_recommendation["role_signals_json"]))
+            self.assertEqual(json.loads(single_recommendation["enrichment_json"])["rnp"]["status"], "clear")
+            csv_content = export_csv(run["run_id"])
+            self.assertTrue(csv_content.startswith(b"\xef\xbb\xbf"))
+            csv_content = csv_content.decode("utf-8-sig")
+            self.assertIn("enrichment", csv_content.splitlines()[0])
+            self.assertIn("role_signals", csv_content.splitlines()[0])
+            xlsx_content = export_xlsx(run["run_id"])
+            self.assertTrue(xlsx_content.startswith(b"PK"))
+            workbook = load_workbook(BytesIO(xlsx_content), read_only=True)
+            self.assertIn("Источник классификации", [cell.value for cell in workbook["Объяснения"][1]])
 
     def test_normal_inn_is_preserved_as_text(self):
         self.assertEqual(normalize_inn("7804428656"), "7804428656")
@@ -197,6 +244,18 @@ class IngestionTests(unittest.TestCase):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_item_similarity_uses_normalized_position_weights(self):
+        item_weights = {"33.12.1": 0.5, "61.10.11.110": 0.5}
+        self.assertEqual(weighted_code_similarity(item_weights, ["33.12.1"]), 0.5)
+        self.assertEqual(weighted_code_similarity(item_weights, ["33.12.18.000"]), 0.35)
+        self.assertEqual(weighted_code_similarity(item_weights, ["33.12.1", "61.10.11.110"]), 1.0)
+        self.assertEqual(weighted_code_similarity({"33.12.1": 0.5, "": 0.5}, ["33.12.1"]), 0.5)
+
+    def test_new_msp_candidate_coverage_is_weighted_by_target_items(self):
+        item_weights = {"33.12.1": 0.25, "61.10.11.110": 0.75}
+        self.assertEqual(_msp_item_coverage(item_weights, "33.12"), 0.25)
+        self.assertEqual(_msp_item_coverage(item_weights, "33.12,61.10"), 1.0)
+
     def test_okpd_hierarchy(self):
         self.assertEqual(code_similarity("33.12.1", "33.12.1"), 1.0)
         self.assertEqual(code_similarity("33.12.1", "33.12.18.000"), 0.7)
@@ -210,6 +269,15 @@ class MatchingTests(unittest.TestCase):
             text_similarity("Поставка медицинского оборудования", "Медицинского оборудования"),
             1.0,
         )
+
+    def test_roles_use_okved_and_supplier_history_signals(self):
+        self.assertEqual(_role(None, "10.11", 0, 0)[0], "производитель")
+        self.assertEqual(_role(None, "46.90", 0, 0)[0], "дистрибьютор")
+        self.assertEqual(_role(None, "", 12, 1)[0], "дистрибьютор")
+        self.assertEqual(_role(None, "", 0, 0)[0], "не определена")
+        self.assertIn("промышленный ОКВЭД 10-33", _role_signals(None, "10.11", 0, 0))
+        self.assertIn("торговый ОКВЭД 46", _role_signals(None, "46.90", 0, 0))
+        self.assertIn("недостаточно сигналов", _role_signals(None, "", 0, 0)[0])
 
     def test_rare_procurement_terms_receive_more_retrieval_weight(self):
         with temporary_database():
@@ -229,7 +297,7 @@ class MatchingTests(unittest.TestCase):
                     "INSERT INTO participations(lot_id,supplier_inn,is_winner) VALUES(?,?,1)",
                     [("rare-match", "7804428656"), ("common-match", "7802023485")],
                 )
-                candidates, text_weights, _ = _candidate_sources(
+                candidates, text_weights, _, _, _ = _candidate_sources(
                     conn,
                     {"lot_id": "target", "publish_date": "2024-12-31"},
                     [],
@@ -238,6 +306,156 @@ class MatchingTests(unittest.TestCase):
                 )
             self.assertGreater(text_weights["rare-match"], text_weights["common-match"])
             self.assertIn("7804428656", candidates)
+
+    def test_exact_okpd_candidates_precede_broader_prefix_matches(self):
+        with temporary_database():
+            with store.connection() as conn:
+                conn.execute("INSERT INTO lots(lot_id,publish_date) VALUES('target','2024-12-31')")
+                history = [(f"broad-{index}", f"2024-01-{index + 1:02d}") for index in range(3)]
+                history.append(("exact", "2024-02-01"))
+                conn.executemany("INSERT INTO lots(lot_id,publish_date) VALUES(?,?)", history)
+                conn.executemany(
+                    "INSERT INTO lot_items(lot_id,pos,product_name,okpd2_code) VALUES(?,?,?,?)",
+                    [(f"broad-{index}", 1, "Тест", "33.19.1") for index in range(3)]
+                    + [("exact", 1, "Тест", "33.12.1")],
+                )
+                conn.executemany(
+                    "INSERT INTO participations(lot_id,supplier_inn,is_winner) VALUES(?,?,1)",
+                    [(f"broad-{index}", "7810000000") for index in range(3)]
+                    + [("exact", "7804428656")],
+                )
+                candidates, _, _, _, _ = _candidate_sources(
+                    conn,
+                    {"lot_id": "target", "publish_date": "2024-12-31"},
+                    ["33.12.1"],
+                    "",
+                    2,
+                    include_msp_candidates=False,
+                )
+            self.assertEqual(list(candidates)[0], "7804428656")
+
+    def test_ranking_metrics_measure_hit_recall_ndcg_and_mrr(self):
+        metrics = ranking_metrics(["other", "winner-a", "winner-b"], {"winner-a", "winner-b"}, k=3)
+        self.assertEqual(metrics["hit_rate"], 1.0)
+        self.assertEqual(metrics["recall"], 1.0)
+        self.assertAlmostEqual(metrics["mrr"], 0.5)
+        self.assertGreater(metrics["ndcg"], 0.0)
+
+    def test_temporal_backtest_uses_only_pre_target_history(self):
+        notices = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+            "01.01.2025;1;9;100;Тест;Тест;false;;780401001;АИС ГЗ\n"
+            "02.07.2025;2;10;100;Тест;Тест;false;;780401001;АИС ГЗ\n"
+        ).encode()
+        items = "lot_id;product_name;okpd2_code\n9;Тест;33.12.1\n10;Тест;33.12.1\n".encode()
+        suppliers = (
+            "lot_id;supplier_inn;supplier_kpp;is_winner\n"
+            "9;7804428656;780401001;true\n"
+            "10;7804428656;780401001;true\n"
+        ).encode()
+        with temporary_database():
+            import_csv_bytes(
+                ("notices.csv", notices),
+                ("items.csv", items),
+                ("suppliers.csv", suppliers),
+            )
+            result = run_backtest(
+                start_date="2025-07-01",
+                end_date="2025-08-01",
+                max_lots=5,
+                top_k=5,
+            )
+        self.assertEqual(result["evaluated_lots"], 1)
+        self.assertEqual(result["recommendation"]["hit_rate"], 1.0)
+        self.assertEqual(result["baseline"]["hit_rate"], 1.0)
+
+    def test_text_match_recommends_supplier_when_okpd2_is_new(self):
+        notices = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+            "2024-01-01;1;old;100;medical software procurement;software support for clinic;false;;780401001;AIS\n"
+            "2025-07-01;2;target;100;medical software procurement;software support for clinic;false;;780401001;AIS\n"
+        ).encode()
+        items = (
+            "lot_id;product_name;okpd2_code\n"
+            "old;software support and maintenance;21.20.1\n"
+            "target;software support and maintenance;62.02.20.190\n"
+        ).encode()
+        suppliers = "lot_id;supplier_inn;supplier_kpp;is_winner\nold;7804428656;780401001;true\n".encode()
+        with temporary_database():
+            import_csv_bytes(
+                ("notices.csv", notices),
+                ("items.csv", items),
+                ("suppliers.csv", suppliers),
+            )
+            result = recommend("target", top_k=5, persist=False, check_registries=False)
+        candidate = next(item for item in result["items"] if item["inn"] == "7804428656")
+        self.assertEqual(candidate["factor_scores"]["F1"], 0.0)
+        self.assertGreater(candidate["factor_scores"]["F2"], 0.0)
+        self.assertEqual(candidate["evidence"][0]["item_coverage"], 0.0)
+        self.assertGreater(candidate["evidence"][0]["text_similarity"], 0.0)
+
+
+class RegistryLookupTests(unittest.TestCase):
+    def test_fns_lookup_returns_active_registry_rows(self):
+        payload = json.dumps(
+            {
+                "dtQueryEnd": "01.10.2026 12:00:00",
+                "data": [
+                    {
+                        "inn": "7804428656",
+                        "is_active": 1,
+                        "name_ex": "Компания",
+                        "category": 1,
+                        "okved1": "33.12",
+                        "regioncode": "78",
+                    }
+                ]
+            }
+        ).encode()
+        with patch("app.registries.urlopen", return_value=BytesIO(payload)):
+            records, error = lookup_msp(["7804428656"])
+        self.assertIsNone(error)
+        self.assertEqual(records["7804428656"]["name"], "Компания")
+        self.assertEqual(records["7804428656"]["region"], "78")
+        self.assertEqual(records["7804428656"]["source"], "Реестр МСП ФНС")
+        self.assertEqual(records["7804428656"]["checked_at"], "01.10.2026 12:00:00")
+
+    def test_fns_profile_lookup_uses_page_size_token(self):
+        first_page = json.dumps(
+            {"data": [], "pageNav": {"pageSizes": [["100", "page-token"]]}}
+        ).encode()
+        second_page = json.dumps(
+            {
+                "dtQueryEnd": "2026-10-01T12:00:00Z",
+                "data": [
+                    {
+                        "inn": "7804428656",
+                        "is_active": 1,
+                        "name_ex": "Компания",
+                        "category": 1,
+                        "okved1": "33.12",
+                        "regioncode": "78",
+                    }
+                ],
+            }
+        ).encode()
+        with patch("app.registries.urlopen", side_effect=[BytesIO(first_page), BytesIO(second_page)]) as request:
+            records, error = lookup_msp_by_profile(["33"], "78", 100)
+        self.assertIsNone(error)
+        self.assertIn("7804428656", records)
+        self.assertEqual(request.call_count, 2)
+
+    def test_rnp_public_search_reports_clear_and_unknown(self):
+        no_records = b'<div class="search-results"><p class="noRecords">No records</p></div>'
+        with patch("app.registries.urlopen", return_value=BytesIO(no_records)):
+            self.assertEqual(_lookup_rnp_one("7804428656")["status"], "clear")
+        listed = b'<div class="search-results"><div class="registry-entry">7804428656</div></div>'
+        with patch("app.registries.urlopen", return_value=BytesIO(listed)):
+            self.assertEqual(_lookup_rnp_one("7804428656")["status"], "listed")
+        with patch("app.registries.urlopen", side_effect=URLError("TLS verification failed")):
+            self.assertIsNone(_lookup_rnp_one("7804428656"))
 
 
 if __name__ == "__main__":

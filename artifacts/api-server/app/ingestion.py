@@ -6,7 +6,7 @@ import io
 import json
 import re
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Iterator
 
@@ -426,97 +426,3 @@ def _rebuild_lot_tokens(conn) -> None:
             "INSERT OR IGNORE INTO lot_tokens(lot_id,token) VALUES (?,?)",
             ((row["lot_id"], token) for token in words),
         )
-
-
-def import_registry_csv(
-    kind: str,
-    filename: str,
-    content: bytes,
-) -> dict[str, object]:
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    aliases = {
-        "inn": {"inn", "supplier_inn", "идентификационный номер налогоплательщика"},
-        "name": {"name", "company_name", "full_name", "наименование", "наименование организации"},
-        "category": {"category", "категория"},
-        "okved": {"okved", "okved_code", "оквэд", "код оквэд"},
-        "region": {"region", "регион"},
-        "included_at": {"included_at", "date_included", "дата включения"},
-        "reg_number": {"reg_number", "number", "номер реестровой записи"},
-        "date_in": {"date_in", "date_start", "дата включения в рнп"},
-        "date_out": {"date_out", "date_end", "дата исключения из рнп"},
-    }
-    required = {"inn", "name", "okved"} if kind == "msp" else {"inn", "reg_number"}
-    text = io.TextIOWrapper(io.BytesIO(content), encoding="utf-8-sig", newline="")
-    reader = csv.DictReader(text, delimiter=";")
-    raw_headers = reader.fieldnames or []
-    normalized_headers = {header.strip().lower(): header for header in raw_headers}
-    mapping = {
-        target: next((normalized_headers[candidate] for candidate in choices if candidate in normalized_headers), None)
-        for target, choices in aliases.items()
-    }
-    missing = sorted(field for field in required if not mapping.get(field))
-    if missing:
-        raise HTTPException(status_code=400, detail={"file": filename, "missing_columns": missing})
-
-    count = 0
-    table = "msp" if kind == "msp" else "rnp"
-    with connection() as conn:
-        conn.execute(f"DELETE FROM {table}")
-        for row_number, raw in enumerate(reader, start=2):
-            if not raw or all(not str(v or "").strip() for v in raw.values()):
-                continue
-            try:
-                inn = normalize_inn(raw.get(mapping["inn"]) if mapping["inn"] else None)
-                if not inn:
-                    continue
-                if kind == "msp":
-                    okved_value = (raw.get(mapping["okved"]) if mapping["okved"] else "") or ""
-                    conn.execute(
-                        """INSERT INTO msp(inn,name,category,okved,region,included_at,source_file,fetched_at)
-                        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(inn) DO UPDATE SET name=excluded.name,
-                        category=excluded.category,okved=excluded.okved,region=excluded.region,
-                        included_at=excluded.included_at,source_file=excluded.source_file,fetched_at=excluded.fetched_at""",
-                        (
-                            inn,
-                            (raw.get(mapping["name"]) if mapping["name"] else "") or None,
-                            (raw.get(mapping["category"]) if mapping["category"] else "") or None,
-                            okved_value.strip(),
-                            (raw.get(mapping["region"]) if mapping["region"] else "") or None,
-                            parse_date(raw.get(mapping["included_at"]) if mapping["included_at"] else None),
-                            filename,
-                            fetched_at,
-                        ),
-                    )
-                else:
-                    reg_number = (raw.get(mapping["reg_number"]) if mapping["reg_number"] else "") or ""
-                    conn.execute(
-                        """INSERT INTO rnp(inn,reg_number,date_in,date_out,source_file,fetched_at)
-                        VALUES(?,?,?,?,?,?) ON CONFLICT(inn,reg_number) DO UPDATE SET
-                        date_in=excluded.date_in,date_out=excluded.date_out,
-                        source_file=excluded.source_file,fetched_at=excluded.fetched_at""",
-                        (
-                            inn,
-                            reg_number,
-                            parse_date(raw.get(mapping["date_in"]) if mapping["date_in"] else None),
-                            parse_date(raw.get(mapping["date_out"]) if mapping["date_out"] else None),
-                            filename,
-                            fetched_at,
-                        ),
-                    )
-                count += 1
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail={"file": filename, "row": row_number, "error": str(exc)}) from exc
-        metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM metadata")}
-        source_hashes = json.loads(metadata.get("source_hashes", "{}"))
-        source_hashes[f"registry:{table}"] = hashlib.sha256(content).hexdigest()
-        data_version = _data_version(source_hashes)
-        for key, value in (
-            (f"{table}_source_date", fetched_at),
-            ("source_hashes", json.dumps(source_hashes, ensure_ascii=False, sort_keys=True)),
-            ("data_version", data_version),
-        ):
-            conn.execute(
-                "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
-    return {"source": table, "records_loaded": count, "source_file": filename, "fetched_at": fetched_at}

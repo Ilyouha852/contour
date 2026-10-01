@@ -9,6 +9,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from .config import load_scoring_config
+from .registries import FNS_PUBLIC_URL, RNP_SEARCH_URL, lookup_msp, lookup_msp_by_profile, lookup_rnp
 from .store import connection
 from .text import text_similarity, tokenize
 
@@ -37,6 +38,32 @@ def code_similarity(left: str, right: str) -> float:
     return 0.0
 
 
+def weighted_code_similarity(item_weights: dict[str, float], history_codes: list[str]) -> float:
+    total_weight = sum(max(0.0, weight) for weight in item_weights.values())
+    if total_weight <= 0 or not history_codes:
+        return 0.0
+    covered_weight = sum(
+        max(0.0, weight)
+        * max((code_similarity(target, code) for code in history_codes), default=0.0)
+        for target, weight in item_weights.items()
+    )
+    return min(1.0, covered_weight / total_weight)
+
+
+def _msp_item_coverage(item_weights: dict[str, float], okved: str) -> float:
+    total_weight = sum(max(0.0, weight) for weight in item_weights.values())
+    if total_weight <= 0:
+        return 0.0
+    okved_codes = [part.strip() for part in (okved or "").replace("|", ",").split(",")]
+    matched_weight = sum(
+        max(0.0, weight)
+        for target, weight in item_weights.items()
+        if target
+        and any(code.startswith(target[:2]) for code in okved_codes if code)
+    )
+    return min(1.0, matched_weight / total_weight)
+
+
 def _effective_date(value: str | None) -> date:
     if not value:
         return date.today()
@@ -56,19 +83,15 @@ def _years_since(published: str | None, target: date) -> float:
         return 8.0
 
 
-def _active_rnp(conn, inns: list[str], today: date) -> set[str]:
-    if not inns:
-        return set()
-    placeholders = ",".join("?" for _ in inns)
-    rows = conn.execute(
-        f"""SELECT DISTINCT inn FROM rnp
-        WHERE inn IN ({placeholders}) AND (date_out IS NULL OR date_out='' OR date_out>=?)""",
-        (*inns, today.isoformat()),
-    )
-    return {row["inn"] for row in rows}
-
-
-def _candidate_sources(conn, lot: dict[str, Any], item_codes: list[str], title: str, limit: int):
+def _candidate_sources(
+    conn,
+    lot: dict[str, Any],
+    item_codes: list[str],
+    title: str,
+    limit: int,
+    *,
+    include_msp_candidates: bool = True,
+):
     target_date = _effective_date(lot.get("publish_date"))
     where_parts: list[str] = []
     params: list[Any] = [lot["lot_id"], target_date.isoformat()]
@@ -77,6 +100,26 @@ def _candidate_sources(conn, lot: dict[str, Any], item_codes: list[str], title: 
             continue
         where_parts.append("(i.okpd2_code=? OR substr(i.okpd2_code,1,5)=? OR substr(i.okpd2_code,1,2)=?)")
         params.extend((code, code[:5], code[:2]))
+    exact_rows = []
+    exact_codes = item_codes[:500]
+    if exact_codes:
+        marks = ",".join("?" for _ in exact_codes)
+        exact_rows = conn.execute(
+            f"""SELECT matching.supplier_inn,COUNT(*) AS category_lots,
+                SUM(matching.is_winner) AS category_wins
+            FROM (
+                SELECT DISTINCT p.supplier_inn,p.lot_id,p.is_winner
+                FROM participations p
+                JOIN lots l ON l.lot_id=p.lot_id
+                JOIN lot_items i ON i.lot_id=p.lot_id
+                WHERE p.lot_id<>? AND l.publish_date IS NOT NULL AND l.publish_date<?
+                  AND i.okpd2_code IN ({marks})
+            ) AS matching
+            GROUP BY matching.supplier_inn
+            ORDER BY category_wins DESC,category_lots DESC,matching.supplier_inn
+            LIMIT ?""",
+            (lot["lot_id"], target_date.isoformat(), *exact_codes, limit),
+        ).fetchall()
     category_rows = []
     if where_parts:
         category_rows = conn.execute(
@@ -159,48 +202,43 @@ def _candidate_sources(conn, lot: dict[str, Any], item_codes: list[str], title: 
         )
 
     candidates: dict[str, dict[str, Any]] = {}
-    for row in category_rows:
+    for row in exact_rows:
         candidates[row["supplier_inn"]] = {
             "category_lots": int(row["category_lots"] or 0),
             "category_wins": int(row["category_wins"] or 0),
             "source_msp": False,
         }
+    for row in category_rows:
+        if row["supplier_inn"] not in candidates and len(candidates) < limit:
+            candidates[row["supplier_inn"]] = {
+                "category_lots": int(row["category_lots"] or 0),
+                "category_wins": int(row["category_wins"] or 0),
+                "source_msp": False,
+            }
     for inn in sorted(text_supplier_inns):
-        candidates.setdefault(inn, {"category_lots": 0, "category_wins": 0, "source_msp": False})
+        if inn not in candidates and len(candidates) < limit:
+            candidates[inn] = {"category_lots": 0, "category_wins": 0, "source_msp": False}
 
-    # In a thin category, add only matching MСП companies from the local registry.
+    profile_msp: dict[str, dict] = {}
+    registry_error = None
     win_total = sum(int(row["category_wins"] or 0) for row in category_rows)
     leading_wins = int(category_rows[0]["category_wins"] or 0) if category_rows else 0
     weak_category = len(category_rows) <= 5 or (win_total > 0 and leading_wins / win_total > 0.6)
-    if weak_category and item_codes:
+    if include_msp_candidates and weak_category and item_codes:
         prefixes = sorted({code[:2] for code in item_codes if len(code) >= 2})
         region = (lot.get("customer_kpp") or "")[:2]
-        params: list[str] = []
-        conditions: list[str] = []
-        for prefix in prefixes:
-            conditions.append("okved LIKE ?")
-            params.append(f"{prefix}%")
-        region_clause = ""
-        if region in {"78", "47"}:
-            region_clause = " AND (region=? OR region LIKE ?)"
-            params.extend((region, f"{region}%"))
-        if conditions:
-            msp_rows = conn.execute(
-                f"""SELECT inn FROM msp WHERE ({' OR '.join(conditions)}){region_clause}
-                ORDER BY included_at DESC LIMIT 100""",
-                params,
-            ).fetchall()
-            for row in msp_rows:
-                if row["inn"] not in candidates:
-                    candidates[row["inn"]] = {
-                        "category_lots": 0,
-                        "category_wins": 0,
-                        "source_msp": True,
-                    }
-                    if len(candidates) >= limit:
-                        break
+        profile_msp, registry_error = lookup_msp_by_profile(prefixes, region, min(100, limit))
+        for inn in profile_msp:
+            if inn not in candidates:
+                candidates[inn] = {
+                    "category_lots": 0,
+                    "category_wins": 0,
+                    "source_msp": True,
+                }
+                if len(candidates) >= limit:
+                    break
 
-    return candidates, text_weights, text_supplier_inns
+    return candidates, text_weights, text_supplier_inns, profile_msp, registry_error
 
 
 def _supplier_history(conn, inns: list[str], lot: dict[str, Any], text_lot_ids: list[str]):
@@ -263,9 +301,27 @@ def _role(name: str | None, okved: str, class_count: int, wins: int) -> tuple[st
     return "не определена", 0.35
 
 
-def _active_msp(conn, inn: str):
-    row = conn.execute("SELECT * FROM msp WHERE inn=?", (inn,)).fetchone()
-    return dict(row) if row else None
+def _role_signals(name: str | None, okved: str, class_count: int, wins: int) -> list[str]:
+    normalized_name = (name or "").lower()
+    okved_codes = [
+        part.strip().split(".")[0]
+        for part in (okved or "").replace("|", ",").split(",")
+        if part.strip()
+    ]
+    signals = []
+    if any(code.isdigit() and 10 <= int(code) <= 33 for code in okved_codes):
+        signals.append("промышленный ОКВЭД 10-33")
+    if any(code.startswith("46") for code in okved_codes):
+        signals.append("торговый ОКВЭД 46")
+    if any(word in normalized_name for word in MANUFACTURER_WORDS):
+        signals.append("производственный маркер в названии")
+    if any(word in normalized_name for word in DISTRIBUTOR_WORDS):
+        signals.append("торговый маркер в названии")
+    if class_count >= 12:
+        signals.append(f"широкий профиль: {class_count} классов ОКПД2")
+    elif 1 <= class_count <= 4 and wins >= 3:
+        signals.append(f"узкий профиль: {class_count} классов, {wins} побед")
+    return signals or ["недостаточно сигналов для уверенной классификации"]
 
 
 def _score_supplier(
@@ -274,11 +330,13 @@ def _score_supplier(
     history: list[dict[str, Any]],
     total_lots: int,
     item_codes: list[str],
+    item_weights: dict[str, float],
     title: str,
     lot: dict[str, Any],
     text_weights: dict[str, float],
     category_total_wins: int,
-    is_risk: bool,
+    is_risk: bool | None,
+    msp_status: str,
     msp: dict[str, Any] | None,
     weights: dict[str, float],
     parameters: dict[str, float],
@@ -297,15 +355,13 @@ def _score_supplier(
     text_numerator = 0.0
     text_denominator = max(1e-9, sum(text_weights.values()))
     own_lots = {event["lot_id"] for event in history}
+    best_item_coverage = 0.0
 
     if info.get("source_msp") and not history:
         okved = (msp or {}).get("okved", "")
-        code_match = any(
-            any(code.strip().startswith(target[:2]) for code in okved.replace("|", ",").split(","))
-            for target in item_codes
-        )
+        best_item_coverage = _msp_item_coverage(item_weights, okved)
         raw_scores = {
-            "F1": 0.35 if code_match else 0.0,
+            "F1": 0.35 * best_item_coverage,
             "F2": 0.0,
             "F3": 0.0,
             "F4": 0.0,
@@ -317,7 +373,8 @@ def _score_supplier(
     else:
         for event in history:
             codes = event["codes_list"]
-            similarity = max((code_similarity(target, code) for target in item_codes for code in codes), default=0.0)
+            similarity = weighted_code_similarity(item_weights, codes)
+            best_item_coverage = max(best_item_coverage, similarity)
             published = event.get("publish_date")
             age_years = _years_since(published, target_date)
             participation_weight = 1.0 if event["is_winner"] else loss_weight
@@ -332,27 +389,30 @@ def _score_supplier(
                         customer_wins += 1
                     if published and (most_recent_similar_win is None or published > most_recent_similar_win):
                         most_recent_similar_win = published
-            if similarity > 0 and event["is_winner"]:
+            if event["is_winner"]:
                 product_text = event.get("products") or ""
                 event_title = " ".join([event.get("procedure_name") or "", event.get("subject") or "", product_text])
                 text_score = text_similarity(title, event_title)
                 if event["lot_id"] in text_weights:
-                    text_numerator += text_weights[event["lot_id"]]
-                evidence_score = similarity * 0.65 + text_score * 0.35
-                evidence.append(
-                    (
-                        evidence_score,
-                        {
-                            "lot_id": event["lot_id"],
-                            "publish_date": event["publish_date"],
-                            "title": event.get("procedure_name") or event.get("subject") or "",
-                            "okpd2": codes[:5],
-                            "customer_inn": event.get("customer_inn"),
-                            "is_winner": True,
-                            "price": event.get("start_price"),
-                        },
+                    text_numerator += text_weights[event["lot_id"]] * text_score
+                if similarity > 0 or (event["lot_id"] in text_weights and text_score >= 0.25):
+                    evidence_score = similarity * 0.65 + text_score * 0.35
+                    evidence.append(
+                        (
+                            evidence_score,
+                            {
+                                "lot_id": event["lot_id"],
+                                "publish_date": event["publish_date"],
+                                "title": event.get("procedure_name") or event.get("subject") or "",
+                                "okpd2": codes[:5],
+                                "item_coverage": round(similarity, 4),
+                                "text_similarity": round(text_score, 4),
+                                "customer_inn": event.get("customer_inn"),
+                                "is_winner": True,
+                                "price": event.get("start_price"),
+                            },
+                        )
                     )
-                )
             for code in codes:
                 if code:
                     parts = code.split(".")
@@ -383,25 +443,29 @@ def _score_supplier(
         supplier_region = (candidate_kpp or "")[:2]
         if supplier_region in {"78", "47"}:
             raw_scores["F7"] = 1.0 if target_region in {"78", "47"} else 0.5
-        raw_scores["F8"] = 1.0 if lot.get("is_smp") != 1 else (1.0 if msp else 0.0)
-        if lot.get("is_smp") == 1 and msp is None:
-            raw_scores["F8"] = 0.0
+        if lot.get("is_smp") == 1:
+            raw_scores["F8"] = {"member": 1.0, "not_member": 0.0, "unknown": 0.5}[msp_status]
+        else:
+            raw_scores["F8"] = 1.0
 
     factors = {key: round(weights[key] * max(0.0, min(1.0, value)), 4) for key, value in raw_scores.items()}
-    multiplier = 0.0 if is_risk else min(1.0, 0.6 + 0.1 * total_lots)
+    multiplier = 0.0 if is_risk is True else min(1.0, 0.6 + 0.1 * total_lots)
     if info.get("source_msp") and not history:
         multiplier = min(multiplier, 0.8)
     score = round(100.0 * sum(factors.values()) * multiplier, 2)
-    role, role_conf = _role((msp or {}).get("name"), (msp or {}).get("okved", ""), len(unique_classes), similar_wins)
+    role_name = (msp or {}).get("name")
+    role_okved = (msp or {}).get("okved", "")
+    role, role_conf = _role(role_name, role_okved, len(unique_classes), similar_wins)
+    role_signals = _role_signals(role_name, role_okved, len(unique_classes), similar_wins)
 
-    if is_risk or multiplier < 0.5:
+    if is_risk is True or multiplier < 0.5:
         status = "Риск"
     elif similar_wins >= 3 and most_recent_similar_win:
         recent_days = (target_date - date.fromisoformat(most_recent_similar_win[:10])).days
         status = "Проверенный" if recent_days <= 365 else "Участник"
     elif total_lots > 0:
         status = "Участник"
-    elif msp:
+    elif msp_status == "member":
         status = "Новый (реестр МСП)"
     else:
         status = "Участник"
@@ -418,10 +482,14 @@ def _score_supplier(
         1
         for event in history
         if event["is_winner"]
-        and any(code_similarity(target, code) > 0 for target in item_codes for code in event["codes_list"])
+        and weighted_code_similarity(item_weights, event["codes_list"]) > 0
     )
     leading_codes = ", ".join(code for code, _ in close_codes.most_common(3))
     fragments = []
+    if item_weights and best_item_coverage > 0:
+        fragments.append(f"максимальное покрытие позиций по ОКПД2: {best_item_coverage:.0%}")
+    if text_numerator > 0:
+        fragments.append("найдены победы в текстово-похожих закупках")
     if explained_wins:
         fragments.append(f"победил в {explained_wins} закупках по близким ОКПД2 {leading_codes}".strip())
     elif info.get("source_msp"):
@@ -430,9 +498,16 @@ def _score_supplier(
         fragments.append("участвовал в похожих закупках")
     if customer_wins:
         fragments.append(f"{customer_wins} побед у этого заказчика")
-    if msp:
+    if msp_status == "member":
         fragments.append("включён в реестр МСП")
-    fragments.append("значится в РНП" if is_risk else "в действующем РНП не значится")
+    elif msp_status == "unknown":
+        fragments.append("статус МСП не проверен")
+    if is_risk is True:
+        fragments.append("значится в РНП")
+    elif is_risk is False:
+        fragments.append("в действующем РНП не найден")
+    else:
+        fragments.append("статус РНП не проверен")
     explanation = "; ".join(fragments) + "."
 
     return {
@@ -441,9 +516,13 @@ def _score_supplier(
         "score": score,
         "role": role,
         "role_conf": round(role_conf, 2),
+        "role_source": "ФНС: ОКВЭД/название" if msp else "история закупок",
+        "role_signals": role_signals,
         "status": status,
-        "msp": msp is not None,
-        "risk": is_risk,
+        "msp": msp_status == "member",
+        "msp_status": msp_status,
+        "risk": is_risk is True,
+        "risk_status": "listed" if is_risk is True else "clear" if is_risk is False else "unknown",
         "factors": factors,
         "factor_scores": {key: round(value, 4) for key, value in raw_scores.items()},
         "evidence": evidence_out,
@@ -475,6 +554,7 @@ def recommend(
     *,
     persist: bool = True,
     run_id: str | None = None,
+    check_registries: bool = True,
 ) -> dict[str, Any] | None:
     started = datetime.now(timezone.utc)
     run_id = run_id or __import__("uuid").uuid4().hex
@@ -484,9 +564,15 @@ def recommend(
             return None
         lot = dict(lot_row)
         items = conn.execute(
-            "SELECT product_name,okpd2_code FROM lot_items WHERE lot_id=? ORDER BY pos", (lot_id,)
+            "SELECT product_name,okpd2_code,weight FROM lot_items WHERE lot_id=? ORDER BY pos", (lot_id,)
         ).fetchall()
-        item_codes = sorted({row["okpd2_code"] for row in items if row["okpd2_code"]})
+        item_weights: dict[str, float] = defaultdict(float)
+        for row in items:
+            item_weights[row["okpd2_code"] or ""] += float(row["weight"] or 0.0)
+        item_codes = sorted(
+            (code for code in item_weights if code),
+            key=lambda code: (-item_weights[code], code),
+        )
         item_names = " ".join(row["product_name"] for row in items)
         title = " ".join((lot.get("procedure_name") or "", lot.get("subject") or "", item_names))
         metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM metadata")}
@@ -494,39 +580,83 @@ def recommend(
         if loss_weight is not None:
             parameters["loss_weight"] = loss_weight
 
-        candidates, text_weights, _ = _candidate_sources(conn, lot, item_codes, title, MAX_CANDIDATES)
+        candidates, text_weights, _, profile_msp, profile_error = _candidate_sources(
+            conn,
+            lot,
+            item_codes,
+            title,
+            MAX_CANDIDATES,
+            include_msp_candidates=check_registries,
+        )
         inns = list(candidates)[:MAX_CANDIDATES]
-        risky_inns = _active_rnp(conn, inns, date.today())
-        histories, total_lots_by_supplier = _supplier_history(conn, inns, lot, list(text_weights))
-        msp_by_inn = {
-            row["inn"]: dict(row)
-            for start in range(0, len(inns), 300)
-            for row in conn.execute(
-                f"SELECT * FROM msp WHERE inn IN ({','.join('?' for _ in inns[start:start+300])})",
-                inns[start : start + 300],
+        if check_registries:
+            msp_by_inn, msp_error = lookup_msp(inns)
+            msp_by_inn = {**profile_msp, **msp_by_inn}
+            rnp_by_inn = lookup_rnp(inns)
+            msp_checked_at = next(
+                (record.get("checked_at") for record in msp_by_inn.values() if record.get("checked_at")),
+                datetime.now(timezone.utc).isoformat(),
             )
-        } if inns else {}
+            rnp_checked_at = datetime.now(timezone.utc).isoformat()
+        else:
+            msp_by_inn, msp_error, rnp_by_inn = {}, None, {}
+            msp_checked_at = rnp_checked_at = None
+        histories, total_lots_by_supplier = _supplier_history(conn, inns, lot, list(text_weights))
 
         records = []
         for inn in inns:
             info = candidates[inn]
-            records.append(
-                _score_supplier(
-                    inn=inn,
-                    info=info,
-                    history=histories.get(inn, []),
-                    total_lots=total_lots_by_supplier.get(inn, 0),
-                    item_codes=item_codes,
-                    title=title,
-                    lot=lot,
-                    text_weights=text_weights,
-                    category_total_wins=info.get("category_wins", 0),
-                    is_risk=inn in risky_inns,
-                    msp=msp_by_inn.get(inn),
-                    weights=weights,
-                    parameters=parameters,
-                )
+            msp_status = (
+                "unknown"
+                if not check_registries or msp_error
+                else "member"
+                if inn in msp_by_inn
+                else "not_member"
             )
+            msp_record = msp_by_inn.get(inn)
+            rnp_record = rnp_by_inn.get(inn)
+            rnp_status = (
+                True if rnp_record and rnp_record["status"] == "listed" else
+                False if rnp_record and rnp_record["status"] == "clear" else None
+            )
+            item = _score_supplier(
+                inn=inn,
+                info=info,
+                history=histories.get(inn, []),
+                total_lots=total_lots_by_supplier.get(inn, 0),
+                item_codes=item_codes,
+                item_weights=dict(item_weights),
+                title=title,
+                lot=lot,
+                text_weights=text_weights,
+                category_total_wins=info.get("category_wins", 0),
+                is_risk=rnp_status,
+                msp_status=msp_status,
+                msp=msp_record,
+                weights=weights,
+                parameters=parameters,
+            )
+            item["enrichment"] = {
+                "msp": {
+                    "status": msp_status,
+                    "source": (msp_record or {}).get("source", "Реестр МСП ФНС"),
+                    "source_url": (msp_record or {}).get("source_url", FNS_PUBLIC_URL),
+                    "checked_at": (msp_record or {}).get("checked_at") or msp_checked_at,
+                    "name": (msp_record or {}).get("name"),
+                    "category": (msp_record or {}).get("category"),
+                    "okved": (msp_record or {}).get("okved"),
+                    "region": (msp_record or {}).get("region"),
+                    "included_at": (msp_record or {}).get("included_at"),
+                },
+                "rnp": rnp_record
+                or {
+                    "status": "unknown",
+                    "source": "Единая информационная система закупок (ЕИС), реестр РНП",
+                    "source_url": RNP_SEARCH_URL,
+                    "checked_at": rnp_checked_at,
+                },
+            }
+            records.append(item)
         records.sort(key=lambda item: (-item["score"], -item["_category_wins"], -item["_wins"], item["inn"]))
         results = []
         for rank, item in enumerate(records[:top_k], start=1):
@@ -552,9 +682,10 @@ def recommend(
             )
             conn.executemany(
                 """INSERT INTO recommendations
-                (run_id,lot_id,rank,supplier_inn,supplier_name,score,role,role_conf,status,is_msp,risk,
-                 factors_json,factor_scores_json,evidence_json,explanation)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (run_id,lot_id,rank,supplier_inn,supplier_name,score,role,role_conf,role_source,role_signals_json,
+                 status,is_msp,risk,
+                 msp_status,risk_status,enrichment_json,factors_json,factor_scores_json,evidence_json,explanation)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     (
                         run_id,
@@ -565,9 +696,14 @@ def recommend(
                         result["score"],
                         result["role"],
                         result["role_conf"],
+                        result["role_source"],
+                        json.dumps(result["role_signals"], ensure_ascii=False),
                         result["status"],
                         int(result["msp"]),
                         int(result["risk"]),
+                        result["msp_status"],
+                        result["risk_status"],
+                        json.dumps(result["enrichment"], ensure_ascii=False),
                         json.dumps(result["factors"], ensure_ascii=False),
                         json.dumps(result["factor_scores"], ensure_ascii=False),
                         json.dumps(result["evidence"], ensure_ascii=False),
@@ -583,12 +719,42 @@ def recommend(
             "data_version": data_version,
             "lot": lot,
             "items": results,
+            "registry_checks": {
+                "msp": "not_run" if not check_registries else "unavailable" if msp_error else "available",
+                "msp_candidate_search": (
+                    "not_run" if not check_registries else "unavailable" if profile_error else "available"
+                ),
+                "rnp": (
+                    "not_run"
+                    if not check_registries
+                    else "not_needed"
+                    if not rnp_by_inn
+                    else "unavailable"
+                    if rnp_by_inn and all(value is None for value in rnp_by_inn.values())
+                    else "partial"
+                    if any(value is None for value in rnp_by_inn.values())
+                    else "available"
+                ),
+                "errors": {
+                    key: value
+                    for key, value in (
+                        ("msp", msp_error),
+                        ("msp_candidate_search", profile_error),
+                        (
+                            "rnp",
+                            "ЕИС недоступна или TLS-сертификат источника не прошёл проверку"
+                            if any(value is None for value in rnp_by_inn.values())
+                            else None,
+                        ),
+                    )
+                    if value
+                },
+            },
         }
 
 
 def supplier_profile(inn: str) -> dict[str, Any] | None:
     with connection() as conn:
-        msp_row = conn.execute("SELECT * FROM msp WHERE inn=?", (inn,)).fetchone()
         participations = conn.execute(
             """SELECT p.lot_id,p.is_winner,p.supplier_kpp,l.publish_date,l.procedure_name,l.subject,
                     l.start_price,l.customer_inn,GROUP_CONCAT(DISTINCT i.okpd2_code) AS codes
@@ -600,73 +766,97 @@ def supplier_profile(inn: str) -> dict[str, Any] | None:
             ORDER BY l.publish_date DESC""",
             (inn,),
         ).fetchall()
-        if not msp_row and not participations:
-            return None
-        active_rnp = conn.execute(
-            "SELECT * FROM rnp WHERE inn=? ORDER BY date_in DESC", (inn,)
-        ).fetchall()
-        category_counts: Counter[str] = Counter()
-        for row in participations:
-            for code in (row["codes"] or "").split(","):
-                if code:
-                    category_counts[code[:5]] += int(row["is_winner"])
-        winner_count = sum(int(row["is_winner"]) for row in participations)
-        kpp = next((row["supplier_kpp"] for row in participations if row["supplier_kpp"]), None)
-        return {
-            "inn": inn,
-            "name": msp_row["name"] if msp_row else None,
-            "is_msp": bool(msp_row),
-            "role": _role(
-                msp_row["name"] if msp_row else None,
-                msp_row["okved"] if msp_row else "",
-                len(category_counts),
-                winner_count,
-            )[0],
-            "role_conf": _role(
-                msp_row["name"] if msp_row else None,
-                msp_row["okved"] if msp_row else "",
-                len(category_counts),
-                winner_count,
-            )[1],
-            "region": (msp_row["region"] if msp_row else None) or ((kpp or "")[:2] or None),
-            "stats": {
-                "lots": len(participations),
-                "wins": winner_count,
-                "win_rate": round(winner_count / len(participations), 3) if participations else None,
-                "categories": len(category_counts),
+
+    msp_by_inn, msp_error = lookup_msp([inn])
+    msp = msp_by_inn.get(inn)
+    rnp_record = lookup_rnp([inn]).get(inn)
+    rnp_status = (
+        True if rnp_record and rnp_record["status"] == "listed" else
+        False if rnp_record and rnp_record["status"] == "clear" else None
+    )
+    msp_status = "member" if msp else "unknown" if msp_error else "not_member"
+    checked_at = datetime.now(timezone.utc).isoformat()
+    if not msp and not participations and rnp_status is not True:
+        return None
+
+    category_counts: Counter[str] = Counter()
+    for row in participations:
+        for code in (row["codes"] or "").split(","):
+            if code:
+                category_counts[code[:5]] += int(row["is_winner"])
+    winner_count = sum(int(row["is_winner"]) for row in participations)
+    kpp = next((row["supplier_kpp"] for row in participations if row["supplier_kpp"]), None)
+    role_name = (msp or {}).get("name")
+    role_okved = (msp or {}).get("okved", "")
+    role, role_conf = _role(role_name, role_okved, len(category_counts), winner_count)
+    role_signals = _role_signals(role_name, role_okved, len(category_counts), winner_count)
+    return {
+        "inn": inn,
+        "name": (msp or {}).get("name"),
+        "is_msp": msp_status == "member",
+        "msp_status": msp_status,
+        "risk_status": "listed" if rnp_status is True else "clear" if rnp_status is False else "unknown",
+        "role": role,
+        "role_conf": role_conf,
+        "role_source": "ФНС: ОКВЭД/название" if msp else "история закупок",
+        "role_signals": role_signals,
+        "region": (msp or {}).get("region") or ((kpp or "")[:2] or None),
+        "stats": {
+            "lots": len(participations),
+            "wins": winner_count,
+            "win_rate": round(winner_count / len(participations), 3) if participations else None,
+            "categories": len(category_counts),
+        },
+        "categories": [
+            {"okpd2": code, "wins": wins} for code, wins in category_counts.most_common(20)
+        ],
+        "history": [
+            {
+                "lot_id": row["lot_id"],
+                "publish_date": row["publish_date"],
+                "title": row["procedure_name"] or row["subject"],
+                "okpd2": (row["codes"] or "").split(","),
+                "is_winner": bool(row["is_winner"]),
+                "customer_inn": row["customer_inn"],
+                "price": row["start_price"],
+            }
+            for row in participations[:100]
+        ],
+        "registry_checks": {
+            "msp": "unavailable" if msp_error else "available",
+            "rnp": "unavailable" if rnp_status is None else "available",
+            "errors": {
+                key: value
+                for key, value in (
+                    ("msp", msp_error),
+                    (
+                        "rnp",
+                        "ЕИС недоступна или TLS-сертификат источника не прошёл проверку"
+                        if rnp_status is None
+                        else None,
+                    ),
+                )
+                if value
             },
-            "categories": [
-                {"okpd2": code, "wins": wins} for code, wins in category_counts.most_common(20)
-            ],
-            "history": [
-                {
-                    "lot_id": row["lot_id"],
-                    "publish_date": row["publish_date"],
-                    "title": row["procedure_name"] or row["subject"],
-                    "okpd2": (row["codes"] or "").split(","),
-                    "is_winner": bool(row["is_winner"]),
-                    "customer_inn": row["customer_inn"],
-                    "price": row["start_price"],
-                }
-                for row in participations[:100]
-            ],
-            "enrichment_sources": [
-                {
-                    "source": "Реестр МСП ФНС",
-                    "source_file": msp_row["source_file"],
-                    "fetched_at": msp_row["fetched_at"],
-                    "included_at": msp_row["included_at"],
-                }
-                for _ in ([msp_row] if msp_row else [])
-            ]
-            + [
-                {
-                    "source": "РНП ФАС",
-                    "source_file": row["source_file"],
-                    "fetched_at": row["fetched_at"],
-                    "date_in": row["date_in"],
-                    "date_out": row["date_out"],
-                }
-                for row in active_rnp
-            ],
-        }
+        },
+        "enrichment": {
+            "msp": {
+                "status": msp_status,
+                "source": (msp or {}).get("source", "Реестр МСП ФНС"),
+                "source_url": (msp or {}).get("source_url", FNS_PUBLIC_URL),
+                "checked_at": (msp or {}).get("checked_at") or checked_at,
+                "name": (msp or {}).get("name"),
+                "category": (msp or {}).get("category"),
+                "okved": (msp or {}).get("okved"),
+                "region": (msp or {}).get("region"),
+                "included_at": (msp or {}).get("included_at"),
+            },
+            "rnp": rnp_record
+            or {
+                "status": "unknown",
+                "source": "Единая информационная система закупок (ЕИС), реестр РНП",
+                "source_url": RNP_SEARCH_URL,
+                "checked_at": checked_at,
+            },
+        },
+    }

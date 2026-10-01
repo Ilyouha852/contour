@@ -15,8 +15,9 @@ from .store import connection
 def _rows_for_run(run_id: str) -> list[dict[str, Any]]:
     with connection() as conn:
         rows = conn.execute(
-            """SELECT lot_id,rank,supplier_inn,supplier_name,score,role,role_conf,status,is_msp,risk,
-                      factors_json,factor_scores_json,evidence_json,explanation
+            """SELECT lot_id,rank,supplier_inn,supplier_name,score,role,role_conf,role_source,role_signals_json,status,is_msp,risk,
+                      msp_status,risk_status,
+                      enrichment_json,factors_json,factor_scores_json,evidence_json,explanation
             FROM recommendations WHERE run_id=? ORDER BY lot_id,rank""",
             (run_id,),
         ).fetchall()
@@ -35,9 +36,14 @@ def export_csv(run_id: str) -> bytes:
             "score",
             "role",
             "role_conf",
+            "role_source",
+            "role_signals",
             "status",
             "msp",
             "risk",
+                "msp_status",
+                "risk_status",
+                "enrichment",
             "factors",
             "factor_scores",
             "evidence",
@@ -54,9 +60,14 @@ def export_csv(run_id: str) -> bytes:
                 row["score"],
                 row["role"],
                 row["role_conf"],
+                row["role_source"],
+                row["role_signals_json"],
                 row["status"],
-                "true" if row["is_msp"] else "false",
-                "true" if row["risk"] else "false",
+                    "true" if row["is_msp"] else "false" if row["msp_status"] == "not_member" else "unknown",
+                    "true" if row["risk"] else "false" if row["risk_status"] == "clear" else "unknown",
+                    row["msp_status"],
+                    row["risk_status"],
+                row["enrichment_json"],
                 row["factors_json"],
                 row["factor_scores_json"],
                 row["evidence_json"],
@@ -72,10 +83,23 @@ def export_xlsx(run_id: str) -> bytes:
     recommendations = workbook.active
     recommendations.title = "Рекомендации"
     recommendations.append(
-        ["Лот", "Ранг", "ИНН", "Наименование", "Оценка", "Роль", "Уверенность", "Статус", "МСП", "Риск"]
+            ["Лот", "Ранг", "ИНН", "Наименование", "Оценка", "Роль", "Уверенность", "Статус", "МСП", "Риск", "Проверка МСП", "Проверка РНП"]
     )
     explanations = workbook.create_sheet("Объяснения")
-    explanations.append(["Лот", "Ранг", "ИНН", "Факторы (вклад)", "Оценки факторов", "Лоты-доказательства", "Объяснение"])
+    explanations.append(
+        [
+            "Лот",
+            "Ранг",
+            "ИНН",
+            "Источник классификации",
+            "Сигналы роли",
+            "Источники и дата проверки",
+            "Факторы (вклад)",
+            "Оценки факторов",
+            "Лоты-доказательства",
+            "Объяснение",
+        ]
+    )
 
     for row in rows:
         recommendations.append(
@@ -88,8 +112,10 @@ def export_xlsx(run_id: str) -> bytes:
                 row["role"],
                 row["role_conf"],
                 row["status"],
-                bool(row["is_msp"]),
-                bool(row["risk"]),
+                    "true" if row["is_msp"] else "false" if row["msp_status"] == "not_member" else "unknown",
+                    "true" if row["risk"] else "false" if row["risk_status"] == "clear" else "unknown",
+                    row["msp_status"],
+                    row["risk_status"],
             ]
         )
         explanations.append(
@@ -97,6 +123,9 @@ def export_xlsx(run_id: str) -> bytes:
                 row["lot_id"],
                 row["rank"],
                 row["supplier_inn"],
+                row["role_source"],
+                row["role_signals_json"],
+                row["enrichment_json"],
                 row["factors_json"],
                 row["factor_scores_json"],
                 row["evidence_json"],

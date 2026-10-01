@@ -73,9 +73,10 @@ def execute_batch(run_id: str, lot_ids: list[str], top_k: int, loss_weight: floa
                 with connection() as conn:
                     conn.executemany(
                         """INSERT OR REPLACE INTO recommendations
-                        (run_id,lot_id,rank,supplier_inn,supplier_name,score,role,role_conf,status,is_msp,risk,
-                         factors_json,factor_scores_json,evidence_json,explanation)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (run_id,lot_id,rank,supplier_inn,supplier_name,score,role,role_conf,role_source,role_signals_json,
+                         status,is_msp,risk,
+                         msp_status,risk_status,enrichment_json,factors_json,factor_scores_json,evidence_json,explanation)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             (
                                 run_id,
@@ -86,9 +87,14 @@ def execute_batch(run_id: str, lot_ids: list[str], top_k: int, loss_weight: floa
                                 item["score"],
                                 item["role"],
                                 item["role_conf"],
+                                item["role_source"],
+                                json.dumps(item["role_signals"], ensure_ascii=False),
                                 item["status"],
                                 int(item["msp"]),
                                 int(item["risk"]),
+                                item["msp_status"],
+                                item["risk_status"],
+                                json.dumps(item["enrichment"], ensure_ascii=False),
                                 json.dumps(item["factors"], ensure_ascii=False),
                                 json.dumps(item["factor_scores"], ensure_ascii=False),
                                 json.dumps(item["evidence"], ensure_ascii=False),

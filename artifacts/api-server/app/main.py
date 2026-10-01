@@ -16,7 +16,8 @@ from .batch import MAX_BATCH_LOTS, create_batch_run, execute_batch
 from .config import SOURCE_DIR
 from .engine import get_lot, recommend, supplier_profile
 from .exports import export_csv, export_xlsx, parse_run_row
-from .ingestion import import_csv_bytes, import_registry_csv, read_upload
+from .ingestion import import_csv_bytes, read_upload
+from .registries import search_msp
 from .schemas import BatchRunRequest, RecommendRequest
 from .store import connection, initialize_database
 
@@ -107,13 +108,12 @@ def dataset_stats() -> dict[str, Any]:
             "items": conn.execute("SELECT COUNT(*) FROM lot_items").fetchone()[0],
             "participations": conn.execute("SELECT COUNT(*) FROM participations").fetchone()[0],
             "suppliers": conn.execute("SELECT COUNT(DISTINCT supplier_inn) FROM participations").fetchone()[0],
-            "msp": conn.execute("SELECT COUNT(*) FROM msp").fetchone()[0],
-            "rnp_records": conn.execute("SELECT COUNT(*) FROM rnp").fetchone()[0],
         }
         metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM metadata")}
         last_date = conn.execute("SELECT MAX(publish_date) FROM lots").fetchone()[0]
     return {
         "counts": counts,
+        "registry_sources": {"msp": "configured", "rnp": "configured"},
         "coverage": {
             "lots_with_items_percent": round(100 * counts["lots_with_items"] / counts["lots"], 2)
             if counts["lots"]
@@ -218,23 +218,31 @@ def lot_detail(lot_id: str) -> dict[str, Any]:
 def search_suppliers(q: str = Query(min_length=1), limit: int = Query(default=20, ge=1, le=100)) -> dict:
     needle = f"%{q.strip()}%"
     with connection() as conn:
-        rows = conn.execute(
-            """SELECT m.inn,m.name,m.category,m.region,
-                (SELECT COUNT(DISTINCT p.lot_id) FROM participations p WHERE p.supplier_inn=m.inn) AS lots,
-                (SELECT COUNT(DISTINCT p.lot_id) FROM participations p WHERE p.supplier_inn=m.inn AND p.is_winner=1) AS wins
-            FROM msp m WHERE m.inn LIKE ? OR m.name LIKE ?
-            ORDER BY wins DESC,lots DESC LIMIT ?""",
-            (needle, needle, limit),
-        ).fetchall()
         historical = conn.execute(
             """SELECT p.supplier_inn AS inn,NULL AS name,NULL AS category,substr(MAX(p.supplier_kpp),1,2) AS region,
                 COUNT(DISTINCT p.lot_id) AS lots,SUM(p.is_winner) AS wins
             FROM participations p
-            WHERE p.supplier_inn LIKE ? AND p.supplier_inn NOT IN (SELECT inn FROM msp)
+            WHERE p.supplier_inn LIKE ?
             GROUP BY p.supplier_inn ORDER BY wins DESC,lots DESC LIMIT ?""",
             (needle, limit),
         ).fetchall()
-    return {"items": [dict(row) for row in (*rows, *historical)][:limit]}
+    msp_rows, msp_error = search_msp(q, limit)
+    historical_by_inn = {row["inn"]: dict(row) for row in historical}
+    for record in msp_rows:
+        existing = historical_by_inn.get(record["inn"])
+        if existing:
+            existing.update(record)
+        else:
+            historical_by_inn[record["inn"]] = record | {"lots": 0, "wins": 0}
+    results = sorted(
+        historical_by_inn.values(),
+        key=lambda row: (-int(row.get("wins") or 0), -int(row.get("lots") or 0), row["inn"]),
+    )[:limit]
+    return {
+        "items": results,
+        "registry_check": "unavailable" if msp_error else "available",
+        "registry_error": msp_error,
+    }
 
 
 @app.get("/api/v1/suppliers/{inn}", tags=["suppliers"])
@@ -297,21 +305,3 @@ def _check_admin(token: str | None) -> None:
     expected = os.getenv("ADMIN_TOKEN")
     if expected and (token is None or not hmac.compare_digest(token, expected)):
         raise HTTPException(status_code=401, detail="Требуется действительный X-Admin-Token")
-
-
-@app.post("/api/v1/enrichment/refresh", tags=["enrichment"])
-async def refresh_enrichment(
-    msp_file: UploadFile | None = File(default=None, description="CSV выгрузки реестра МСП ФНС"),
-    rnp_file: UploadFile | None = File(default=None, description="CSV выгрузки реестра РНП ФАС"),
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
-) -> dict[str, Any]:
-    _check_admin(x_admin_token)
-    if msp_file is None and rnp_file is None:
-        raise HTTPException(status_code=400, detail="Загрузите хотя бы один файл: msp_file или rnp_file")
-    results = []
-    for kind, upload in (("msp", msp_file), ("rnp", rnp_file)):
-        if upload is not None:
-            item = await read_upload(upload)
-            assert item is not None
-            results.append(import_registry_csv(kind, item[0], item[1]))
-    return {"updated": results}
