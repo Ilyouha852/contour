@@ -484,7 +484,7 @@ def recommend(
             return None
         lot = dict(lot_row)
         items = conn.execute(
-            "SELECT product_name,okpd2_code FROM lot_items WHERE lot_id=? ORDER BY pos LIMIT 50", (lot_id,)
+            "SELECT product_name,okpd2_code FROM lot_items WHERE lot_id=? ORDER BY pos", (lot_id,)
         ).fetchall()
         item_codes = sorted({row["okpd2_code"] for row in items if row["okpd2_code"]})
         item_names = " ".join(row["product_name"] for row in items)

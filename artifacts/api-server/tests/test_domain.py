@@ -64,6 +64,36 @@ class IngestionTests(unittest.TestCase):
                     conn.execute("SELECT value FROM metadata WHERE key='ingestion_summary'").fetchone()
                 )
 
+    def test_import_skips_malformed_inns_and_preserves_all_lot_positions(self):
+        notices = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+            "01.01.2024;1;10;100;Тест;Тест;false;7804105239;780401001;АИС ГЗ\n"
+        ).encode()
+        items = ("lot_id;product_name;okpd2_code\n" + "".join(
+            f"10;Позиция {index};33.12.1\n" for index in range(51)
+        )).encode()
+        suppliers = (
+            "lot_id;supplier_inn;supplier_kpp;is_winner\n"
+            "10;UJ65120100;780601001;false\n"
+            "10;7804428656;780601001;true\n"
+        ).encode()
+        with temporary_database():
+            result = import_csv_bytes(
+                ("notices.csv", notices),
+                ("items.csv", items),
+                ("suppliers.csv", suppliers),
+            )
+            with store.connection() as conn:
+                item_count = conn.execute("SELECT COUNT(*) FROM lot_items").fetchone()[0]
+                participation_count = conn.execute("SELECT COUNT(*) FROM participations").fetchone()[0]
+                weight_sum = conn.execute("SELECT SUM(weight) FROM lot_items WHERE lot_id='10'").fetchone()[0]
+            self.assertEqual(item_count, 51)
+            self.assertAlmostEqual(weight_sum, 1.0)
+            self.assertEqual(participation_count, 1)
+            self.assertEqual(result["counts"]["skipped_invalid_inn"], 1)
+            self.assertEqual(result["ingestion_summary"]["files"]["suppliers"]["invalid_inn_rows"], 1)
+
     def test_append_import_identifies_its_single_lot_even_when_history_exists(self):
         notices_header = (
             "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"

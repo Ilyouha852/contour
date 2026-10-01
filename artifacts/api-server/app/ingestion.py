@@ -282,12 +282,12 @@ def import_csv_bytes(
                     if not inn:
                         raise ValueError("supplier_inn не может быть пустым")
                 except ValueError as exc:
-                    if "научной нотации" not in str(exc):
-                        raise HTTPException(
-                            status_code=400,
-                            detail={"file": supplier_name, "row": line, "error": str(exc)},
-                        ) from exc
-                    counts["skipped_unrecoverable_inn"] += 1
+                    counter = (
+                        "skipped_unrecoverable_inn"
+                        if "научной нотации" in str(exc)
+                        else "skipped_invalid_inn"
+                    )
+                    counts[counter] += 1
                     warning_count += 1
                     if len(warnings) < 20:
                         warnings.append(
@@ -316,15 +316,7 @@ def import_csv_bytes(
                 except (ValueError, InvalidOperation) as exc:
                     raise HTTPException(status_code=400, detail={"file": supplier_name, "row": line, "error": str(exc)}) from exc
 
-        # Keep no more than 50 positions per lot and normalize each item's share.
-        conn.execute(
-            """DELETE FROM lot_items WHERE item_id IN (
-              SELECT item_id FROM (
-                SELECT item_id, ROW_NUMBER() OVER (PARTITION BY lot_id ORDER BY pos, item_id) AS position
-                FROM lot_items
-              ) WHERE position > 50
-            )"""
-        )
+        # Preserve every imported position; normalize each item's share within its lot.
         conn.execute(
             """UPDATE lot_items SET weight = 1.0 / (
               SELECT COUNT(*) FROM lot_items AS same_lot WHERE same_lot.lot_id = lot_items.lot_id
@@ -384,6 +376,7 @@ def import_csv_bytes(
                     "imported_rows": counts["participations"],
                     "orphan_rows": counts["orphan_participations"],
                     "unrecoverable_inn_rows": counts["skipped_unrecoverable_inn"],
+                    "invalid_inn_rows": counts["skipped_invalid_inn"],
                 },
             }
         }
