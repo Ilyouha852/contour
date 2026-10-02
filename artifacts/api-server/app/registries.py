@@ -16,10 +16,14 @@ FNS_SEARCH_URL = "https://rmsp.nalog.ru/search-proc.json"
 FNS_PUBLIC_URL = "https://rmsp.nalog.ru/search.html"
 RNP_SEARCH_URL = "https://zakupki.gov.ru/epz/dishonestsupplier/search/results.html"
 REQUEST_TIMEOUT = 8
-FNS_MAX_INNS = 30_000
+FNS_MAX_INNS = 100
 RNP_WORKERS = 8
 USER_AGENT = "CounterpartyRecommender/1.0 (public registry lookup)"
 _rnp_executor = ThreadPoolExecutor(max_workers=RNP_WORKERS)
+
+
+def msp_search_url(inn: str) -> str:
+    return f"{FNS_PUBLIC_URL}?{urlencode({'mode': 'quick', 'query': inn})}"
 
 
 def _request_fns(payload: dict[str, str], page_size: int | None = None) -> dict:
@@ -67,7 +71,7 @@ def _msp_record(row: dict) -> dict | None:
         "region": row.get("regioncode") or "",
         "included_at": row.get("dtregistry"),
         "source": "Реестр МСП ФНС",
-        "source_url": FNS_PUBLIC_URL,
+        "source_url": msp_search_url(inn),
         "checked_at": row.get("_checked_at"),
     }
 
@@ -85,7 +89,8 @@ def lookup_msp(inns: list[str]) -> tuple[dict[str, dict], str | None]:
                     "sortField": "NAME_EX",
                     "sort": "ASC",
                     "page": "",
-                }
+                },
+                page_size=len(chunk),
             )
             for row in result["data"]:
                 if not isinstance(row, dict):

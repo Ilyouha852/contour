@@ -1,15 +1,18 @@
 from contextlib import contextmanager
 from io import BytesIO
+import asyncio
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.error import URLError
 
 from openpyxl import load_workbook
+from fastapi import HTTPException, UploadFile
 
-from app import store
+from app import dataset_backups, store
 from app.batch import create_batch_run, execute_batch
 from app.engine import (
     _candidate_sources,
@@ -19,11 +22,14 @@ from app.engine import (
     _supplier_history,
     code_similarity,
     recommend,
+    search_lots,
+    suggest_lot_search,
     weighted_code_similarity,
 )
 from app.evaluation import ranking_metrics, run_backtest
-from app.exports import export_csv, export_xlsx
+from app.exports import export_csv, export_passport_html, export_xlsx
 from app.ingestion import import_csv_bytes, normalize_inn, parse_bool, parse_date
+from app.main import get_dataset_backup, import_dataset, rollback_dataset
 from app.registries import _lookup_rnp_one, lookup_msp, lookup_msp_by_profile
 from app.text import text_similarity, tokenize
 
@@ -141,6 +147,119 @@ class IngestionTests(unittest.TestCase):
             self.assertNotIn("msp", tables)
             self.assertNotIn("rnp", tables)
 
+    def test_successful_dataset_replacement_can_be_rolled_back(self):
+        notices_header = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+        )
+        items_header = "lot_id;product_name;okpd2_code\n"
+        backup_dir = Path(tempfile.mkdtemp()) / "backups"
+        self.addCleanup(shutil.rmtree, backup_dir.parent, ignore_errors=True)
+        manifest = backup_dir / "last-successful-replacement.json"
+        with (
+            temporary_database(),
+            patch.object(dataset_backups, "DATASET_BACKUP_DIR", backup_dir),
+            patch.object(dataset_backups, "_MANIFEST", manifest),
+        ):
+            import_csv_bytes(
+                ("old-notices.csv", (notices_header + "01.01.2024;1;old;100;Старый лот;Старый;false;;;").encode()),
+                ("old-items.csv", (items_header + "old;Старый товар;33.12.1\n").encode()),
+                None,
+            )
+            with store.connection() as conn:
+                old_version = conn.execute("SELECT value FROM metadata WHERE key='data_version'").fetchone()[0]
+
+            snapshot = dataset_backups.create_dataset_snapshot()
+            import_csv_bytes(
+                ("new-notices.csv", (notices_header + "01.01.2025;2;new;200;Новый лот;Новый;false;;;").encode()),
+                ("new-items.csv", (items_header + "new;Новый товар;61.10.1\n").encode()),
+                None,
+                replace=True,
+            )
+            dataset_backups.activate_dataset_snapshot(snapshot)
+            self.assertTrue(dataset_backups.dataset_snapshot_status()["available"])
+
+            restored = dataset_backups.restore_last_dataset_snapshot()
+
+            with store.connection() as conn:
+                lot_ids = [row[0] for row in conn.execute("SELECT lot_id FROM lots")]
+                restored_version = conn.execute(
+                    "SELECT value FROM metadata WHERE key='data_version'"
+                ).fetchone()[0]
+            self.assertEqual(lot_ids, ["old"])
+            self.assertEqual(restored_version, old_version)
+            self.assertEqual(restored["data_version"], old_version)
+
+    def test_invalid_replacement_keeps_current_dataset(self):
+        notices_header = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+        )
+        items_header = "lot_id;product_name;okpd2_code\n"
+        with temporary_database():
+            import_csv_bytes(
+                ("old-notices.csv", (notices_header + "01.01.2024;1;old;100;Старый лот;Старый;false;;;").encode()),
+                ("old-items.csv", (items_header + "old;Старый товар;33.12.1\n").encode()),
+                None,
+            )
+            with self.assertRaises(HTTPException):
+                import_csv_bytes(
+                    ("bad-notices.csv", b"wrong;headers\ninvalid;row\n"),
+                    ("new-items.csv", (items_header + "new;Новый товар;61.10.1\n").encode()),
+                    None,
+                    replace=True,
+                )
+            with store.connection() as conn:
+                lot_ids = [row[0] for row in conn.execute("SELECT lot_id FROM lots")]
+            self.assertEqual(lot_ids, ["old"])
+
+    def test_dataset_import_route_and_rollback_route(self):
+        notices_header = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+        )
+        items_header = "lot_id;product_name;okpd2_code\n"
+        backup_dir = Path(tempfile.mkdtemp()) / "backups"
+        self.addCleanup(shutil.rmtree, backup_dir.parent, ignore_errors=True)
+        manifest = backup_dir / "last-successful-replacement.json"
+
+        def upload(filename: str, payload: bytes) -> UploadFile:
+            return UploadFile(file=BytesIO(payload), filename=filename, size=len(payload))
+
+        with (
+            temporary_database(),
+            patch.object(dataset_backups, "DATASET_BACKUP_DIR", backup_dir),
+            patch.object(dataset_backups, "_MANIFEST", manifest),
+            patch.dict("os.environ", {"ADMIN_TOKEN": ""}),
+        ):
+            import_csv_bytes(
+                ("old-notices.csv", (notices_header + "01.01.2024;1;old;100;Старый лот;Старый;false;;;").encode()),
+                ("old-items.csv", (items_header + "old;Старый товар;33.12.1\n").encode()),
+                None,
+            )
+            result = asyncio.run(
+                import_dataset(
+                    notices_file=upload(
+                        "new-notices.csv",
+                        (notices_header + "01.01.2025;2;new;200;Новый лот;Новый;false;;;").encode(),
+                    ),
+                    items_file=upload("new-items.csv", (items_header + "new;Новый товар;61.10.1\n").encode()),
+                    suppliers_file=upload(
+                        "new-suppliers.csv",
+                        b"lot_id;supplier_inn;supplier_kpp;is_winner\nnew;7804428656;;true\n",
+                    ),
+                )
+            )
+            self.assertTrue(result["rollback_available"])
+            self.assertTrue(get_dataset_backup()["available"])
+
+            rollback_result = rollback_dataset(None)
+
+            with store.connection() as conn:
+                lot_ids = [row[0] for row in conn.execute("SELECT lot_id FROM lots")]
+            self.assertEqual(rollback_result["status"], "rolled_back")
+            self.assertEqual(lot_ids, ["old"])
+
     def test_supplier_history_excludes_later_participations(self):
         with temporary_database():
             with store.connection() as conn:
@@ -228,6 +347,12 @@ class IngestionTests(unittest.TestCase):
             self.assertTrue(xlsx_content.startswith(b"PK"))
             workbook = load_workbook(BytesIO(xlsx_content), read_only=True)
             self.assertIn("Источник классификации", [cell.value for cell in workbook["Объяснения"][1]])
+            passport = export_passport_html(run["run_id"])
+            self.assertIn("ПАСПОРТ ДОКАЗАТЕЛЬСТВ", passport)
+            self.assertIn("Факторы и формулы", passport)
+            self.assertIn("Вклад, баллы", passport)
+            self.assertIn("Лот 10", passport)
+            self.assertIn("2026-10-01T12:00:00+00:00", passport)
 
     def test_normal_inn_is_preserved_as_text(self):
         self.assertEqual(normalize_inn("7804428656"), "7804428656")
@@ -334,6 +459,35 @@ class MatchingTests(unittest.TestCase):
                 )
             self.assertEqual(list(candidates)[0], "7804428656")
 
+    def test_keyword_lot_search_ranks_full_token_matches_first(self):
+        notices = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+            "2024-01-01;1;older;100;Обслуживание бассейнов;Работы;false;;780401001;АИС ГЗ\n"
+            "2025-01-01;2;best;200;Комплексное обслуживание бассейнов;Услуги;false;;780401001;АИС ГЗ\n"
+            "2025-06-01;3;partial;300;Обслуживание школы;Услуги;false;;780401001;АИС ГЗ\n"
+        ).encode()
+        items = (
+            "lot_id;product_name;okpd2_code\n"
+            "older;Обслуживание бассейна;33.12.1\n"
+            "best;Ремонт оборудования бассейнов;33.12.1\n"
+            "partial;Обслуживание;33.12.1\n"
+        ).encode()
+        with temporary_database():
+            import_csv_bytes(("notices.csv", notices), ("items.csv", items), None)
+            results = search_lots("обслуживание бассейнов", limit=10)
+            suggestions = suggest_lot_search("обслуживание бассейнов", results)
+            fuzzy_suggestions = suggest_lot_search("обслуживание бассейно", [])
+
+        self.assertEqual([row["lot_id"] for row in results], ["best", "older", "partial"])
+        self.assertEqual(results[0]["matched_terms"], 2)
+        self.assertEqual(results[0]["match_ratio"], 1.0)
+        self.assertEqual(results[0]["item_count"], 1)
+        self.assertEqual(len(suggestions), 2)
+        self.assertIn("бассейнов", suggestions[0]["phrase"].lower())
+        self.assertIn("33.12.1", suggestions[0]["okpd2_codes"])
+        self.assertEqual(fuzzy_suggestions[0]["phrase"], "обслуживание бассейнов")
+
     def test_ranking_metrics_measure_hit_recall_ndcg_and_mrr(self):
         metrics = ranking_metrics(["other", "winner-a", "winner-b"], {"winner-a", "winner-b"}, k=3)
         self.assertEqual(metrics["hit_rate"], 1.0)
@@ -395,6 +549,53 @@ class MatchingTests(unittest.TestCase):
         self.assertGreater(candidate["factor_scores"]["F2"], 0.0)
         self.assertEqual(candidate["evidence"][0]["item_coverage"], 0.0)
         self.assertGreater(candidate["evidence"][0]["text_similarity"], 0.0)
+        self.assertEqual(candidate["enrichment"]["msp"]["source_url"], "https://rmsp.nalog.ru/search.html?mode=quick&query=7804428656")
+        text_detail = candidate["factor_details"]["F2"]
+        self.assertEqual(text_detail["formula"], "min(1, сумма текстовых совпадений / сумма весов выборки)")
+        self.assertEqual(text_detail["weight"], 0.2)
+        self.assertEqual(text_detail["evidence"][0]["lot_id"], "old")
+        f1_limitation = next(row for row in candidate["score_limitations"] if row["factor"] == "F1")
+        expected_lost_points = round(
+            100
+            * candidate["factor_details"]["F1"]["weight"]
+            * (1 - candidate["factor_scores"]["F1"])
+            * candidate["score_modifier"]["value"],
+            2,
+        )
+        self.assertEqual(f1_limitation["lost_points"], expected_lost_points)
+        self.assertIn("истории похожих лотов", f1_limitation["reason"])
+
+    def test_msp_only_candidate_has_factor_details_without_history(self):
+        notices = (
+            "publish_date;procedure_id;lot_id;start_price;procedure_name;subject;is_smp;"
+            "customer_inn;customer_kpp;is_eshop_or_aisgz\n"
+            "2025-07-01;1;target;100;Тестовая закупка;Тест;true;;780401001;АИС ГЗ\n"
+        ).encode()
+        items = "lot_id;product_name;okpd2_code\ntarget;Тест;33.12.1\n".encode()
+        suppliers = "lot_id;supplier_inn;supplier_kpp;is_winner\n".encode()
+        msp_record = {
+            "inn": "7804428656",
+            "name": "Компания из МСП",
+            "okved": "33.12",
+            "region": "78",
+            "source": "Реестр МСП ФНС",
+            "source_url": "https://rmsp.nalog.ru/search.html?mode=quick&query=7804428656",
+            "checked_at": "2026-10-01T12:00:00+00:00",
+        }
+        with temporary_database():
+            import_csv_bytes(("notices.csv", notices), ("items.csv", items), ("suppliers.csv", suppliers))
+            with (
+                patch("app.engine.lookup_msp_by_profile", return_value=({"7804428656": msp_record}, None)),
+                patch("app.engine.lookup_msp", return_value=({}, None)),
+                patch("app.engine.lookup_rnp", return_value={"7804428656": None}),
+            ):
+                result = recommend("target", top_k=5, persist=False)
+
+        candidate = result["items"][0]
+        self.assertEqual(candidate["msp_status"], "member")
+        self.assertEqual(candidate["factor_scores"]["F1"], 0.35)
+        self.assertEqual(candidate["factor_details"]["F1"]["inputs"][0]["value"], 1.0)
+        self.assertEqual(candidate["factor_details"]["F5"]["inputs"][0]["value"], 0)
 
 
 class RegistryLookupTests(unittest.TestCase):
@@ -421,6 +622,38 @@ class RegistryLookupTests(unittest.TestCase):
         self.assertEqual(records["7804428656"]["region"], "78")
         self.assertEqual(records["7804428656"]["source"], "Реестр МСП ФНС")
         self.assertEqual(records["7804428656"]["checked_at"], "01.10.2026 12:00:00")
+        self.assertEqual(
+            records["7804428656"]["source_url"],
+            "https://rmsp.nalog.ru/search.html?mode=quick&query=7804428656",
+        )
+
+    def test_fns_lookup_chunks_large_inn_lists_to_fit_one_page(self):
+        inns = [str(7800000000 + index) for index in range(101)]
+        inns[-1] = "7802174011"
+        requests = []
+
+        def fake_request(payload, page_size=None):
+            batch = payload["innList"].splitlines()
+            requests.append((batch, page_size))
+            return {
+                "data": [
+                    {
+                        "inn": inn,
+                        "is_active": 1,
+                        "name_ex": f"Компания {inn}",
+                    }
+                    for inn in batch
+                ]
+            }
+
+        with patch("app.registries._request_fns", side_effect=fake_request):
+            records, error = lookup_msp(inns)
+
+        self.assertIsNone(error)
+        self.assertEqual([len(batch) for batch, _ in requests], [100, 1])
+        self.assertEqual([page_size for _, page_size in requests], [100, 1])
+        self.assertIn("7802174011", records)
+        self.assertEqual(records["7802174011"]["name"], "Компания 7802174011")
 
     def test_fns_profile_lookup_uses_page_size_token(self):
         first_page = json.dumps(

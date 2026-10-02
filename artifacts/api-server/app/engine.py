@@ -4,12 +4,13 @@ import json
 import math
 import re
 import statistics
+from difflib import get_close_matches
 from collections import Counter, defaultdict
 from datetime import date, datetime, timezone
 from typing import Any
 
 from .config import load_scoring_config
-from .registries import FNS_PUBLIC_URL, RNP_SEARCH_URL, lookup_msp, lookup_msp_by_profile, lookup_rnp
+from .registries import RNP_SEARCH_URL, lookup_msp, lookup_msp_by_profile, lookup_rnp, msp_search_url
 from .store import connection
 from .text import text_similarity, tokenize
 
@@ -349,13 +350,22 @@ def _score_supplier(
     similar_events = 0
     customer_wins = 0
     price_samples: list[float] = []
+    price_sample_evidence: list[dict[str, Any]] = []
     most_recent_similar_win: str | None = None
+    most_recent_similar_win_lot_id: str | None = None
     unique_classes: set[str] = set()
     evidence: list[tuple[float, dict[str, Any]]] = []
+    experience_evidence: list[dict[str, Any]] = []
+    text_evidence: list[dict[str, Any]] = []
+    customer_evidence: list[dict[str, Any]] = []
     text_numerator = 0.0
     text_denominator = max(1e-9, sum(text_weights.values()))
     own_lots = {event["lot_id"] for event in history}
     best_item_coverage = 0.0
+    target_region = (lot.get("customer_kpp") or "")[:2]
+    supplier_region = ""
+    median_price: float | None = None
+    days_old: int | None = None
 
     if info.get("source_msp") and not history:
         okved = (msp or {}).get("okved", "")
@@ -378,23 +388,62 @@ def _score_supplier(
             published = event.get("publish_date")
             age_years = _years_since(published, target_date)
             participation_weight = 1.0 if event["is_winner"] else loss_weight
-            experience += participation_weight * similarity * (gamma**age_years)
+            recency_weight = gamma**age_years
+            experience_contribution = participation_weight * similarity * recency_weight
+            experience += experience_contribution
             if similarity > 0:
                 similar_events += 1
+                experience_evidence.append(
+                    {
+                        "lot_id": event["lot_id"],
+                        "publish_date": published,
+                        "is_winner": bool(event["is_winner"]),
+                        "item_coverage": round(similarity, 4),
+                        "recency_weight": round(recency_weight, 4),
+                        "contribution": round(experience_contribution, 4),
+                    }
+                )
                 if event["is_winner"]:
                     similar_wins += 1
                     if event.get("start_price") and event["start_price"] > 0:
                         price_samples.append(float(event["start_price"]))
+                        price_sample_evidence.append(
+                            {
+                                "lot_id": event["lot_id"],
+                                "publish_date": published,
+                                "price": float(event["start_price"]),
+                            }
+                        )
                     if event.get("customer_inn") and event["customer_inn"] == lot.get("customer_inn"):
                         customer_wins += 1
+                        customer_evidence.append(
+                            {
+                                "lot_id": event["lot_id"],
+                                "publish_date": published,
+                                "title": event.get("procedure_name") or event.get("subject") or "",
+                            }
+                        )
                     if published and (most_recent_similar_win is None or published > most_recent_similar_win):
                         most_recent_similar_win = published
+                        most_recent_similar_win_lot_id = event["lot_id"]
             if event["is_winner"]:
                 product_text = event.get("products") or ""
                 event_title = " ".join([event.get("procedure_name") or "", event.get("subject") or "", product_text])
                 text_score = text_similarity(title, event_title)
                 if event["lot_id"] in text_weights:
-                    text_numerator += text_weights[event["lot_id"]] * text_score
+                    text_contribution = text_weights[event["lot_id"]] * text_score
+                    text_numerator += text_contribution
+                    if text_contribution > 0:
+                        text_evidence.append(
+                            {
+                                "lot_id": event["lot_id"],
+                                "publish_date": published,
+                                "title": event.get("procedure_name") or event.get("subject") or "",
+                                "text_similarity": round(text_score, 4),
+                                "retrieval_weight": round(text_weights[event["lot_id"]], 4),
+                                "contribution": round(text_contribution, 4),
+                            }
+                        )
                 if similarity > 0 or (event["lot_id"] in text_weights and text_score >= 0.25):
                     evidence_score = similarity * 0.65 + text_score * 0.35
                     evidence.append(
@@ -429,10 +478,11 @@ def _score_supplier(
             "F7": 0.3,
             "F8": 1.0,
         }
-        if price_samples and lot.get("start_price") and lot["start_price"] > 0:
-            median = statistics.median(price_samples)
+        median_price = statistics.median(price_samples) if price_samples else None
+        if median_price is not None and lot.get("start_price") and lot["start_price"] > 0:
             raw_scores["F5"] = math.exp(
-                -abs(math.log(float(lot["start_price"])) - math.log(median)) / max(0.05, parameters["price_sigma"])
+                -abs(math.log(float(lot["start_price"])) - math.log(median_price))
+                / max(0.05, parameters["price_sigma"])
             )
         if most_recent_similar_win:
             days_old = max(0, (target_date - date.fromisoformat(most_recent_similar_win[:10])).days)
@@ -474,6 +524,184 @@ def _score_supplier(
         item
         for _, item in sorted(evidence, key=lambda value: value[0], reverse=True)[:3]
     ]
+    recent_win_evidence = (
+        [
+            {
+                "lot_id": most_recent_similar_win_lot_id,
+                "publish_date": most_recent_similar_win,
+                "days_old": days_old,
+            }
+        ]
+        if most_recent_similar_win
+        else []
+    )
+    if info.get("source_msp") and not history:
+        factor_formulas = {
+            "F1": "0.35 × покрытие ОКПД2 из ОКВЭД",
+            "F2": "Нет текстовой истории",
+            "F3": "Нет истории побед",
+            "F4": "Нет побед у этого заказчика",
+            "F5": "Нет исторических цен",
+            "F6": "Нет даты похожей победы",
+            "F7": "Оценка региона по записи МСП",
+            "F8": (
+                "Участник реестра = 100%"
+                if lot.get("is_smp") == 1
+                else "50% для кандидата, найденного через профиль МСП, вне закупки МСП"
+            ),
+        }
+        factor_inputs = {
+            "F1": [
+                {"label": "Покрытие позиций по ОКПД2 из ОКВЭД", "value": round(best_item_coverage, 4)},
+                {"label": "Коэффициент для нового поставщика", "value": 0.35},
+            ],
+            "F2": [{"label": "Текстовая история", "value": "нет"}],
+            "F3": [
+                {"label": "Победы в похожих лотах", "value": 0},
+                {"label": "Похожие участия", "value": 0},
+            ],
+            "F4": [{"label": "Победы у заказчика", "value": 0}],
+            "F5": [{"label": "Исторические цены", "value": 0}],
+            "F6": [{"label": "Похожие победы", "value": "нет"}],
+            "F7": [
+                {"label": "Регион поставщика", "value": (msp or {}).get("region") or "не указан"},
+                {"label": "Регион заказчика", "value": target_region or "не указан"},
+            ],
+            "F8": [
+                {"label": "Статус МСП", "value": msp_status},
+                {"label": "Закупка для МСП", "value": lot.get("is_smp") == 1},
+            ],
+        }
+        factor_evidence: dict[str, list[dict[str, Any]]] = {}
+    else:
+        factor_formulas = {
+            "F1": "1 − exp(−взвешенный опыт / τ)",
+            "F2": "min(1, сумма текстовых совпадений / сумма весов выборки)",
+            "F3": "(похожие победы + α × базовая доля побед) / (похожие участия + α)",
+            "F4": "1 − exp(−победы у заказчика / 2)",
+            "F5": "exp(−|ln(НМЦК лота) − ln(медиана цен побед)| / σ цены)",
+            "F6": "exp(−дней с последней похожей победы / 730)",
+            "F7": "Оценка совпадения регионов по КПП поставщика и заказчика",
+            "F8": (
+                "Для закупки МСП: участник реестра = 100%, не найден = 0%, неизвестно = 50%"
+                if lot.get("is_smp") == 1
+                else "100%, так как целевой лот не ограничен для МСП"
+            ),
+        }
+        factor_inputs = {
+            "F1": [
+                {"label": "Взвешенный опыт с учётом давности", "value": round(experience, 4)},
+                {"label": "Похожие участия", "value": similar_events},
+                {"label": "τ", "value": parameters["tau"]},
+                {"label": "Затухание давности γ", "value": gamma},
+                {"label": "Вес проигранного участия", "value": loss_weight},
+            ],
+            "F2": [
+                {"label": "Сумма текстовых совпадений", "value": round(text_numerator, 4)},
+                {"label": "Сумма весов выборки", "value": round(text_denominator, 4)},
+            ],
+            "F3": [
+                {"label": "Победы в похожих лотах", "value": similar_wins},
+                {"label": "Похожие участия", "value": similar_events},
+                {"label": "α сглаживания", "value": parameters["alpha"]},
+                {"label": "Базовая доля побед", "value": parameters["prior_win_rate"]},
+            ],
+            "F4": [{"label": "Победы у этого заказчика", "value": customer_wins}],
+            "F5": [
+                {"label": "НМЦК целевого лота", "value": lot.get("start_price")},
+                {"label": "Медиана цен похожих побед", "value": median_price},
+                {"label": "Число исторических цен", "value": len(price_samples)},
+                {"label": "σ цены", "value": parameters["price_sigma"]},
+            ],
+            "F6": [
+                {"label": "Дата последней похожей победы", "value": most_recent_similar_win or "нет"},
+                {"label": "Дней с победы", "value": days_old if days_old is not None else "—"},
+            ],
+            "F7": [
+                {"label": "Регион поставщика по КПП", "value": supplier_region or "не указан"},
+                {"label": "Регион заказчика по КПП", "value": target_region or "не указан"},
+            ],
+            "F8": [
+                {"label": "Статус МСП", "value": msp_status},
+                {"label": "Закупка для МСП", "value": lot.get("is_smp") == 1},
+            ],
+        }
+        factor_evidence = {
+            "F1": sorted(experience_evidence, key=lambda row: row["contribution"], reverse=True)[:5],
+            "F2": sorted(text_evidence, key=lambda row: row["contribution"], reverse=True)[:5],
+            "F3": evidence_out,
+            "F4": customer_evidence[:5],
+            "F5": price_sample_evidence[:5],
+            "F6": recent_win_evidence,
+        }
+    factor_details = {
+        key: {
+            "formula": factor_formulas[key],
+            "weight": weights[key],
+            "weighted_contribution": factors[key],
+            "final_contribution": round(100.0 * factors[key] * multiplier, 2),
+            "inputs": factor_inputs[key],
+            "evidence": factor_evidence.get(key, []),
+        }
+        for key in raw_scores
+    }
+    limitation_reasons = {
+        "F1": (
+            "У поставщика нет истории похожих лотов."
+            if not experience_evidence
+            else f"Покрытие позиций по ОКПД2 составляет {best_item_coverage:.0%}; похожих участий: {similar_events}."
+        ),
+        "F2": (
+            "Не найдено текстовых совпадений с историей побед."
+            if text_numerator <= 0
+            else f"Текстовые совпадения покрывают {min(1.0, text_numerator / text_denominator):.0%} взвешенной выборки."
+        ),
+        "F3": f"Победы в похожих закупках: {similar_wins} из {similar_events} участий.",
+        "F4": (
+            "Нет побед у этого заказчика в похожих закупках."
+            if customer_wins == 0
+            else f"Побед у этого заказчика: {customer_wins}."
+        ),
+        "F5": (
+            "Нет исторических цен похожих побед для сравнения."
+            if median_price is None
+            else f"НМЦК {lot.get('start_price')} сопоставлена с медианой исторических цен {median_price:.2f}."
+        ),
+        "F6": (
+            "В истории нет похожих побед."
+            if most_recent_similar_win is None
+            else f"Последняя похожая победа была {days_old} дн. назад."
+        ),
+        "F7": (
+            "Не удалось определить регион поставщика по КПП."
+            if not (info.get("source_msp") and not history) and supplier_region not in {"78", "47"}
+            else f"Регион поставщика: {(msp or {}).get('region') or supplier_region}; регион заказчика: {target_region or 'не указан'}."
+        ),
+        "F8": (
+            f"Статус МСП: {msp_status}; для закупки МСП этот признак влияет на оценку."
+            if lot.get("is_smp") == 1 and msp_status != "member"
+            else ""
+        ),
+    }
+    score_limitations = [
+        {
+            "factor": factor,
+            "score": round(max(0.0, min(1.0, value)), 4),
+            "lost_points": round(100.0 * weights[factor] * (1.0 - max(0.0, min(1.0, value))) * multiplier, 2),
+            "reason": limitation_reasons[factor],
+        }
+        for factor, value in raw_scores.items()
+        if limitation_reasons[factor]
+        and 100.0 * weights[factor] * (1.0 - max(0.0, min(1.0, value))) * multiplier >= 0.1
+    ]
+    score_limitations.sort(key=lambda item: item["lost_points"], reverse=True)
+    modifier_reason = (
+        "Оценка обнулена из-за активной записи в РНП."
+        if is_risk is True
+        else "Применён коэффициент за короткую историю участия."
+        if multiplier < 1.0
+        else "Дополнительный коэффициент не применялся."
+    )
     codes = [code for event in history for code in event["codes_list"]]
     close_codes = Counter(
         code for code in codes if any(code_similarity(target, code) > 0 for target in item_codes)
@@ -525,6 +753,13 @@ def _score_supplier(
         "risk_status": "listed" if is_risk is True else "clear" if is_risk is False else "unknown",
         "factors": factors,
         "factor_scores": {key: round(value, 4) for key, value in raw_scores.items()},
+        "factor_details": factor_details,
+        "score_limitations": score_limitations,
+        "score_modifier": {
+            "value": round(multiplier, 4),
+            "lost_points": round(100.0 * sum(factors.values()) * (1.0 - multiplier), 2),
+            "reason": modifier_reason,
+        },
         "evidence": evidence_out,
         "explain": explanation,
         "_wins": similar_wins,
@@ -545,6 +780,122 @@ def get_lot(lot_id: str) -> dict[str, Any] | None:
         ).fetchall()
         lot["items"] = [dict(item) for item in items]
         return lot
+
+
+def search_lots(query: str, limit: int = 20) -> list[dict[str, Any]]:
+    tokens = list(dict.fromkeys(tokenize(query, limit=8)))
+    if not tokens:
+        return []
+
+    placeholders = ",".join("?" for _ in tokens)
+    with connection() as conn:
+        rows = conn.execute(
+            f"""SELECT l.lot_id,l.publish_date,l.start_price,l.procedure_name,l.subject,
+                       l.is_smp,l.customer_inn,
+                       (SELECT COUNT(*) FROM lot_items i WHERE i.lot_id=l.lot_id) AS item_count,
+                       COUNT(DISTINCT t.token) AS matched_terms,
+                       CAST(COUNT(DISTINCT t.token) AS REAL)/? AS match_ratio
+                FROM lot_tokens t
+                JOIN lots l ON l.lot_id=t.lot_id
+                WHERE t.token IN ({placeholders})
+                GROUP BY l.lot_id
+                ORDER BY match_ratio DESC,matched_terms DESC,
+                         CASE WHEN l.publish_date IS NULL THEN 1 ELSE 0 END,
+                         l.publish_date DESC,l.lot_id DESC
+                LIMIT ?""",
+            (len(tokens), *tokens, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def suggest_lot_search(query: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tokens = list(dict.fromkeys(tokenize(query, limit=8)))
+    suggestions: list[dict[str, Any]] = []
+
+    if results:
+        lot_ids = [row["lot_id"] for row in results]
+        placeholders = ",".join("?" for _ in lot_ids)
+        with connection() as conn:
+            code_rows = conn.execute(
+                f"""SELECT lot_id,okpd2_code,COUNT(*) AS occurrences
+                FROM lot_items WHERE lot_id IN ({placeholders}) AND okpd2_code<>''
+                GROUP BY lot_id,okpd2_code ORDER BY occurrences DESC,okpd2_code""",
+                lot_ids,
+            ).fetchall()
+        codes_by_lot: dict[str, list[str]] = {}
+        for row in code_rows:
+            codes_by_lot.setdefault(row["lot_id"], []).append(row["okpd2_code"])
+
+        for row in results:
+            phrase = " ".join((row.get("procedure_name") or row.get("subject") or "").split())[:160]
+            if not phrase or phrase.casefold() == query.strip().casefold():
+                continue
+            suggestions.append(
+                {
+                    "phrase": phrase,
+                    "reason": f"Формулировка из похожего лота {row['lot_id']}",
+                    "matched_lots": 1,
+                    "okpd2_codes": codes_by_lot.get(row["lot_id"], [])[:5],
+                }
+            )
+            if len(suggestions) >= 3:
+                break
+        return suggestions
+
+    if not tokens:
+        return []
+
+    with connection() as conn:
+        vocabulary = [
+            row["token"]
+            for row in conn.execute(
+                """SELECT token FROM lot_tokens GROUP BY token
+                HAVING COUNT(*)>=2 ORDER BY COUNT(*) DESC LIMIT 4000"""
+            )
+        ]
+
+    for index, token in enumerate(tokens):
+        close = get_close_matches(token, vocabulary, n=2, cutoff=0.68)
+        for replacement in close:
+            if replacement == token:
+                continue
+            candidate_tokens = tokens.copy()
+            candidate_tokens[index] = replacement
+            phrase = " ".join(candidate_tokens)
+            matching = search_lots(phrase, limit=5)
+            if not matching:
+                continue
+            codes = sorted(
+                {
+                    code
+                    for item in matching
+                    for code in (
+                        item.get("okpd2_codes") or []
+                    )
+                }
+            )
+            if not codes:
+                ids = [item["lot_id"] for item in matching]
+                marks = ",".join("?" for _ in ids)
+                with connection() as conn:
+                    codes = [
+                        row["okpd2_code"]
+                        for row in conn.execute(
+                            f"SELECT DISTINCT okpd2_code FROM lot_items WHERE lot_id IN ({marks}) AND okpd2_code<>'' ORDER BY okpd2_code LIMIT 5",
+                            ids,
+                        )
+                    ]
+            suggestions.append(
+                {
+                    "phrase": phrase,
+                    "reason": f"Близкая формулировка; совпадений в базе: {len(matching)}",
+                    "matched_lots": len(matching),
+                    "okpd2_codes": codes[:5],
+                }
+            )
+            if len(suggestions) >= 3:
+                return suggestions
+    return suggestions
 
 
 def recommend(
@@ -640,7 +991,7 @@ def recommend(
                 "msp": {
                     "status": msp_status,
                     "source": (msp_record or {}).get("source", "Реестр МСП ФНС"),
-                    "source_url": (msp_record or {}).get("source_url", FNS_PUBLIC_URL),
+                    "source_url": (msp_record or {}).get("source_url", msp_search_url(inn)),
                     "checked_at": (msp_record or {}).get("checked_at") or msp_checked_at,
                     "name": (msp_record or {}).get("name"),
                     "category": (msp_record or {}).get("category"),
@@ -843,7 +1194,7 @@ def supplier_profile(inn: str) -> dict[str, Any] | None:
             "msp": {
                 "status": msp_status,
                 "source": (msp or {}).get("source", "Реестр МСП ФНС"),
-                "source_url": (msp or {}).get("source_url", FNS_PUBLIC_URL),
+                "source_url": (msp or {}).get("source_url", msp_search_url(inn)),
                 "checked_at": (msp or {}).get("checked_at") or checked_at,
                 "name": (msp or {}).get("name"),
                 "category": (msp or {}).get("category"),

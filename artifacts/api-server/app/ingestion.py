@@ -149,14 +149,20 @@ def _data_version(source_hashes: dict[str, str]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
-async def read_upload(upload: UploadFile | None, required: bool = True) -> tuple[str, bytes] | None:
+async def read_upload(
+    upload: UploadFile | None,
+    required: bool = True,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+) -> tuple[str, bytes] | None:
     if upload is None:
         if required:
             raise HTTPException(status_code=400, detail="Не загружен обязательный CSV-файл")
         return None
-    data = await upload.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"Файл {upload.filename} превышает 25 МБ")
+    data = await upload.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        limit_mb = max_bytes // (1024 * 1024)
+        raise HTTPException(status_code=413, detail=f"Файл {upload.filename} превышает {limit_mb} МБ")
     if not data.strip():
         if required:
             raise HTTPException(status_code=400, detail=f"Файл {upload.filename} пуст")

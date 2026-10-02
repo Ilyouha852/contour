@@ -97,10 +97,6 @@ function getPreviewExamplePath(): string {
   return `${basePath}/preview/ComponentName`;
 }
 
-function Gallery() {
-  return <ProcurementApp />;
-}
-
 function getPreviewPath(): string | null {
   const basePath = getBasePath();
   const { pathname } = window.location;
@@ -124,7 +120,7 @@ function App() {
     );
   }
 
-  return <Gallery />;
+  return <ProcurementApp />;
 }
 
 export default App;

@@ -10,12 +10,19 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 
 from .batch import MAX_BATCH_LOTS, create_batch_run, execute_batch
-from .config import SOURCE_DIR
-from .engine import get_lot, recommend, supplier_profile
-from .exports import export_csv, export_xlsx, parse_run_row
+from .config import MAX_DATASET_FILE_BYTES, MAX_DATASET_TOTAL_BYTES, SOURCE_DIR
+from .dataset_backups import (
+    activate_dataset_snapshot,
+    create_dataset_snapshot,
+    dataset_snapshot_status,
+    discard_dataset_snapshot,
+    restore_last_dataset_snapshot,
+)
+from .engine import get_lot, recommend, search_lots, suggest_lot_search, supplier_profile
+from .exports import export_csv, export_passport_html, export_xlsx, parse_run_row
 from .ingestion import import_csv_bytes, read_upload
 from .registries import search_msp
 from .schemas import BatchRunRequest, RecommendRequest
@@ -144,11 +151,58 @@ async def import_dataset(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ) -> dict[str, Any]:
     _check_admin(x_admin_token)
-    notices = await read_upload(notices_file)
-    items = await read_upload(items_file)
-    suppliers = await read_upload(suppliers_file, required=False)
+    declared_sizes = [
+        getattr(upload, "size", None)
+        for upload in (notices_file, items_file, suppliers_file)
+        if upload is not None
+    ]
+    if all(size is not None for size in declared_sizes) and sum(declared_sizes) > MAX_DATASET_TOTAL_BYTES:
+        raise HTTPException(status_code=413, detail="Суммарный размер CSV не должен превышать 1 ГБ")
+    notices = await read_upload(notices_file, max_bytes=MAX_DATASET_FILE_BYTES)
+    items = await read_upload(items_file, max_bytes=MAX_DATASET_FILE_BYTES)
+    suppliers = await read_upload(
+        suppliers_file,
+        required=False,
+        max_bytes=MAX_DATASET_FILE_BYTES,
+    )
     assert notices is not None and items is not None
-    return import_csv_bytes(notices, items, suppliers)
+    total_bytes = len(notices[1]) + len(items[1]) + (len(suppliers[1]) if suppliers else 0)
+    if total_bytes > MAX_DATASET_TOTAL_BYTES:
+        raise HTTPException(status_code=413, detail="Суммарный размер CSV не должен превышать 1 ГБ")
+
+    snapshot = create_dataset_snapshot()
+    try:
+        result = import_csv_bytes(notices, items, suppliers, replace=True)
+        activate_dataset_snapshot(snapshot)
+    except Exception:
+        discard_dataset_snapshot(snapshot)
+        raise
+    return {
+        **result,
+        "previous_data_version": snapshot["data_version"],
+        "rollback_available": True,
+    }
+
+
+@app.get("/api/v1/datasets/backup", tags=["data"])
+def get_dataset_backup() -> dict[str, Any]:
+    return dataset_snapshot_status()
+
+
+@app.post("/api/v1/datasets/rollback", tags=["data"])
+def rollback_dataset(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    _check_admin(x_admin_token)
+    try:
+        snapshot = restore_last_dataset_snapshot()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "status": "rolled_back",
+        "restored_data_version": snapshot.get("data_version"),
+        "snapshot_created_at": snapshot.get("created_at"),
+    }
 
 
 @app.post("/api/v1/recommendations", tags=["recommendations"])
@@ -204,6 +258,16 @@ async def get_recommendations(request: Request) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=404, detail=f"Лот {lot_id} не найден")
     return result
+
+
+@app.get("/api/v1/lots/search", tags=["lots"])
+def search_lot_records(
+    q: str = Query(min_length=2, max_length=160),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> dict[str, Any]:
+    results = search_lots(q, limit)
+    suggestions = suggest_lot_search(q, results) if len(results) <= 3 else []
+    return {"query": q, "count": len(results), "items": results, "suggestions": suggestions}
 
 
 @app.get("/api/v1/lots/{lot_id}", tags=["lots"])
@@ -298,6 +362,23 @@ def download_batch_export(run_id: str, format: str = Query(default="xlsx", patte
         content=content,
         media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@app.get("/api/v1/batch/runs/{run_id}/passport", tags=["batch"])
+def open_evidence_passport(run_id: str) -> HTMLResponse:
+    with connection() as conn:
+        run = conn.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if run["status"] not in {"done", "failed"}:
+        raise HTTPException(status_code=409, detail="Паспорт появится после завершения запуска")
+    content = export_passport_html(run_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Данные запуска не найдены")
+    return HTMLResponse(
+        content,
+        headers={"Content-Disposition": f'inline; filename="evidence-passport_{quote(run_id)}.html"'},
     )
 
 
